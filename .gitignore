@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+models/*.zip
+models/*.pt
+models/checkpoints/
+reports/tensorboard/**
+reports/training/*.npz
+reports/training/*.jsonl
+reports/evaluation/*.csv
+reports/evaluation/*.json
+reports/figures/*.png
+!reports/**/.gitkeep

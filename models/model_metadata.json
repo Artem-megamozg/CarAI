@@ -1,0 +1,10 @@
+{
+  "version": "0.3",
+  "algorithm": "ppo",
+  "observation_size": 48,
+  "action_size": 2,
+  "behavior_cloning": true,
+  "expert_demo_episodes": 900,
+  "timesteps_requested": 2000000,
+  "seed": 42
+}

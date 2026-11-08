@@ -1,0 +1,8 @@
+{
+  "requested_episodes": 900,
+  "successful_episodes": 900,
+  "failed_episodes": 0,
+  "expert_success_rate": 1.0,
+  "accepted_transitions": 100322,
+  "mean_steps_all_episodes": 111.46888888888888
+}

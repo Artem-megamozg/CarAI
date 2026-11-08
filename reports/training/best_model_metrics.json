@@ -1,0 +1,12 @@
+{
+  "timesteps": 1920000,
+  "episodes": 24,
+  "success_rate": 1.0,
+  "collision_rate": 0.0,
+  "outside_rate": 0.0,
+  "timeout_rate": 0.0,
+  "mean_reward": 213.92311577357103,
+  "mean_distance_m": 0.17872877911112547,
+  "mean_angle_error_deg": 1.8311383550480966,
+  "saved_as_best": 1.0
+}

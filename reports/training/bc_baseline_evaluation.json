@@ -1,0 +1,10 @@
+{
+  "episodes": 100.0,
+  "success_rate": 0.09,
+  "collision_rate": 0.0,
+  "outside_rate": 0.62,
+  "timeout_rate": 0.29000000000000004,
+  "mean_reward": -61.85418415227543,
+  "mean_distance_m": 1.0269674077133315,
+  "mean_angle_error_deg": 6.947637582149348
+}

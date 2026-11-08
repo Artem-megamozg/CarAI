@@ -1,0 +1,34 @@
+project: AutoPark RL
+version: 0.3.0
+simulation:
+  arena_width: 20.0
+  arena_height: 15.0
+  slot_rows: 2
+  slot_columns: 6
+  max_episode_steps: 500
+  dt: 0.1
+  observation_size: 48
+training:
+  default_algorithm: PPO
+  alternative_algorithm: SAC
+  default_rl_timesteps: 2000000
+  expert_demo_episodes: 900
+  behavior_cloning_epochs: 35
+  initial_occupied_probability: 0.14
+  final_occupied_probability: 0.332
+  evaluation_episodes: 24
+  evaluation_frequency: 40000
+  checkpoint_frequency: 200000
+model_selection:
+  primary_metric: success_rate
+  tie_breakers:
+    - collision_rate
+    - outside_bounds_rate
+    - mean_reward
+vehicle:
+  model: kinematic_bicycle
+  length_m: 4.2
+  width_m: 1.8
+  wheelbase_m: 2.65
+  max_speed_mps: 3.0
+  max_steering_deg: 34.0
