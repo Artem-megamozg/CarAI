@@ -1,9 +1,28 @@
 {
-  "requested_episodes": 900,
-  "successful_episodes": 900,
+  "requested_episodes": 1200,
+  "successful_episodes": 1200,
   "failed_episodes": 0,
   "expert_success_rate": 1.0,
-  "accepted_transitions": 100322,
-  "mean_steps_all_episodes": 111.46888888888888,
-  "best_validation_loss": 0.00050049286801368
+  "accepted_transitions": 158101,
+  "mean_steps_successful": 131.75083333333333,
+  "per_mode": {
+    "perpendicular": {
+      "episodes": 300,
+      "success_rate": 1.0
+    },
+    "reverse": {
+      "episodes": 300,
+      "success_rate": 1.0
+    },
+    "parallel": {
+      "episodes": 300,
+      "success_rate": 1.0
+    },
+    "tight": {
+      "episodes": 300,
+      "success_rate": 1.0
+    }
+  },
+  "best_validation_loss": 0.03172411024570465,
+  "epochs": 30
 }

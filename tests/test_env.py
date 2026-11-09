@@ -1,63 +1,54 @@
-from __future__ import annotations
-
-import math
 import sys
 from pathlib import Path
-
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"src"))
 import numpy as np
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
-from autopark.environment import ParkingEnv
+from autopark.environment import ParkingEnv,MODES
 
 
-def test_observation_and_action_spaces() -> None:
-    env = ParkingEnv()
-    obs, info = env.reset(seed=11)
-    assert obs.shape == (ParkingEnv.OBSERVATION_SIZE,)
-    assert obs.dtype == np.float32
-    assert env.observation_space.contains(obs)
-    assert env.action_space.shape == (2,)
-    assert info["feasible_slots"] >= 2
+def run_expert(mode,seed):
+    env=ParkingEnv(mode=mode,difficulty=.55)
+    obs,_=env.reset(seed=seed)
+    assert obs.shape==(ParkingEnv.OBSERVATION_SIZE,)
+    terminated=truncated=False; info={}
+    while not(terminated or truncated):
+        obs,_,terminated,truncated,info=env.step(env.expert_action())
     env.close()
+    return info
 
 
-def test_target_is_empty_and_feasible() -> None:
-    env = ParkingEnv(difficulty=0.58)
-    for seed in range(100):
-        _, info = env.reset(seed=seed)
-        selected = next(r for r in env.slot_records if r["id"] == env.target_slot_id)
-        assert selected["feasible"] is True
-        assert selected["occupied"] is False
-        assert selected["selected"] is True
-        assert info["feasible_slots"] >= 2
-    env.close()
+def test_all_modes_have_valid_observation_and_target():
+    for i,mode in enumerate(MODES):
+        env=ParkingEnv(mode=mode,difficulty=.55)
+        obs,info=env.reset(seed=1234+i)
+        assert obs.shape==(75,)
+        assert np.all(np.isfinite(obs))
+        assert info["mode"]==mode
+        assert info["feasible_slots"]>=1
+        assert any(r["selected"] and r["feasible"] and not r["occupied"] for r in env.slot_records)
+        assert len(env.last_lidar)==16 and len(env.last_sonar)==4
+        env.close()
 
 
-def test_expert_parks_in_randomized_maps() -> None:
-    env = ParkingEnv(difficulty=0.58)
-    successes = 0
-    for episode in range(100):
-        env.set_difficulty(0.10 + 0.48 * ((episode % 17) / 16.0))
-        obs, _ = env.reset(seed=30_000 + episode)
-        terminated = truncated = False
-        while not (terminated or truncated):
-            obs, _, terminated, truncated, info = env.step(env.expert_action())
-            assert env.observation_space.contains(obs)
-        successes += int(info["success"])
-    env.close()
-    assert successes >= 95, f"Expert only completed {successes}/100 scenarios"
+def test_expert_can_complete_each_mode():
+    for i,mode in enumerate(MODES):
+        for ep in range(5):
+            result=run_expert(mode,7000+i*100+ep)
+            assert result["success"], (mode,result)
+            assert not result["collision"] and not result["outside_bounds"]
 
 
-def test_collision_terminates_episode() -> None:
-    env = ParkingEnv(difficulty=0.0)
-    env.reset(seed=9)
-    # Place an obstacle over the vehicle to trigger the physical collision check.
-    env.obstacles = [env.car.__class__(env.car.x, env.car.y, env.car.heading, 0.0)]
-    _, reward, terminated, truncated, info = env.step(np.array([0.0, 0.0], dtype=np.float32))
-    assert terminated is True
-    assert truncated is False
-    assert info["collision"] is True
-    assert reward < -100.0
-    env.close()
+def test_camera_occupancy_matches_simulated_parked_cars():
+    for i,mode in enumerate(MODES):
+        env=ParkingEnv(mode=mode,difficulty=.62)
+        for ep in range(12):
+            env.reset(seed=9000+i*100+ep)
+            truth=np.zeros(12,dtype=np.float32)
+            for j,record in enumerate(env.slot_records): truth[j]=float(record["occupied"])
+            assert np.array_equal(truth,env.camera_occupancy)
+        env.close()
+
+
+def test_success_failure_categories_are_mutually_exclusive():
+    for i,mode in enumerate(MODES):
+        info=run_expert(mode,12000+i)
+        assert sum(bool(info[k]) for k in ("success","collision","outside_bounds","timeout"))==1

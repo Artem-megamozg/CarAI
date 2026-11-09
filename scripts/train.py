@@ -1,438 +1,197 @@
-"""Pretrain from expert demonstrations, then fine-tune with PPO or SAC."""
-
+"""Behavior Cloning -> PPO training for all four AutoPark modes (PPO only)."""
 from __future__ import annotations
-
-import argparse
-import json
-import sys
+import argparse,json,sys
 from pathlib import Path
 from typing import Any
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/"src"))
 import numpy as np
 import torch
-from stable_baselines3 import PPO, SAC
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback,CallbackList
 from stable_baselines3.common.monitor import Monitor
-
-from autopark.environment import ParkingEnv
-from autopark.imitation import (
-    collect_expert_demonstrations,
-    initialize_sb3_actor,
-    save_demonstrations,
-    train_behavior_cloning,
-)
-
+from autopark.environment import ParkingEnv,MODES
+from autopark.imitation import (collect_expert_demonstrations,train_behavior_cloning,
+                                initialize_ppo_actor,save_demonstrations)
 
 class CurriculumCallback(BaseCallback):
-    def __init__(self, env: ParkingEnv, total_timesteps: int, verbose: int = 0):
-        super().__init__(verbose)
-        self.env = env
-        self.total_timesteps = max(1, int(total_timesteps))
-        self.last_difficulty = -1.0
-
-    def _on_step(self) -> bool:
-        progress = min(1.0, self.num_timesteps / self.total_timesteps)
-        difficulty = 0.10 + 0.48 * progress
-        if abs(difficulty - self.last_difficulty) >= 0.025:
-            self.env.set_difficulty(difficulty)
-            self.last_difficulty = difficulty
-            if self.verbose:
-                print(f"\nCurriculum difficulty -> {difficulty:.2f}")
+    def __init__(self,env:ParkingEnv,total_timesteps:int):
+        super().__init__(verbose=1); self.env=env; self.total=max(1,total_timesteps); self.last=-1.0
+    def _on_step(self):
+        progress=min(1.0,self.num_timesteps/self.total)
+        # More empty space at the beginning; progressively denser lots later.
+        difficulty=0.08+0.54*progress
+        if abs(difficulty-self.last)>=0.02:
+            self.env.set_difficulty(difficulty); self.last=difficulty
+            print(f"\nCurriculum difficulty -> {difficulty:.2f}")
         return True
-
 
 class SuccessAwareEvalCallback(BaseCallback):
-    """Select checkpoints by success rate first, not mean reward alone."""
-
-    def __init__(
-        self,
-        eval_env: ParkingEnv,
-        best_model_path: Path,
-        *,
-        eval_freq: int = 40_000,
-        episodes: int = 24,
-        seed: int = 90_000,
-        verbose: int = 1,
-    ):
-        super().__init__(verbose)
-        self.eval_env = eval_env
-        self.best_model_path = best_model_path
-        self.eval_freq = max(1, int(eval_freq))
-        self.episodes = max(1, int(episodes))
-        self.seed = int(seed)
-        self.eval_calls = 0
-        self.best_key = (-1.0, -1.0, -1.0, -1e9)
-        self.metrics_path = ROOT / "reports" / "training" / "success_evaluations.jsonl"
-        self.best_metrics_path = ROOT / "reports" / "training" / "best_model_metrics.json"
-        if self.best_metrics_path.exists():
+    def __init__(self,eval_freq:int,episodes_per_mode:int,best_path:Path):
+        super().__init__(verbose=1); self.eval_freq=max(1,eval_freq); self.n_ep=max(1,episodes_per_mode)
+        self.envs={m:ParkingEnv(mode=m,difficulty=.62) for m in MODES}; self.best_path=best_path
+        self.best_key=(-1.0,-1.0,0.0,-1.0); self.log_path=ROOT/"reports"/"training"/"success_evaluations.jsonl"
+        metrics_file=ROOT/"reports"/"training"/"best_model_metrics.json"
+        if metrics_file.exists():
             try:
-                previous = json.loads(self.best_metrics_path.read_text(encoding="utf-8"))
-                self.best_key = (
-                    float(previous["success_rate"]),
-                    -float(previous["collision_rate"]),
-                    -float(previous["outside_rate"]),
-                    float(previous["mean_reward"]),
-                )
-            except (KeyError, ValueError, json.JSONDecodeError):
+                previous=json.loads(metrics_file.read_text(encoding="utf-8"))
+                per=previous.get("per_mode",{})
+                worst=min((float(v.get("success_rate",0.0)) for v in per.values()),default=float(previous.get("success_rate",0.0)))
+                collision=float(previous.get("collision_rate",np.mean([v.get("collision_rate",0.0) for v in per.values()]) if per else 0.0))
+                outside=float(previous.get("outside_bounds_rate",np.mean([v.get("outside_bounds_rate",0.0) for v in per.values()]) if per else 0.0))
+                self.best_key=(float(previous.get("success_rate",0.0)),worst,-collision-outside,float(previous.get("mean_reward",0.0)))
+            except (ValueError,TypeError,json.JSONDecodeError):
                 pass
-
-    def evaluate(self) -> dict[str, float]:
-        successes = collisions = outside = 0
-        rewards: list[float] = []
-        distances: list[float] = []
-        angle_errors: list[float] = []
-        for episode in range(self.episodes):
-            obs, _ = self.eval_env.reset(seed=self.seed + self.eval_calls * self.episodes + episode)
-            terminated = truncated = False
-            total_reward = 0.0
-            info: dict[str, Any] = {}
-            while not (terminated or truncated):
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = self.eval_env.step(action)
-                total_reward += float(reward)
-            successes += int(bool(info.get("success")))
-            collisions += int(bool(info.get("collision")))
-            outside += int(bool(info.get("outside_bounds")))
-            rewards.append(total_reward)
-            distances.append(float(info.get("distance", np.nan)))
-            angle_errors.append(float(info.get("angle_error_deg", np.nan)))
-
-        result = {
-            "timesteps": int(self.num_timesteps),
-            "episodes": int(self.episodes),
-            "success_rate": successes / self.episodes,
-            "collision_rate": collisions / self.episodes,
-            "outside_rate": outside / self.episodes,
-            "timeout_rate": max(0.0, 1.0 - (successes + collisions + outside) / self.episodes),
-            "mean_reward": float(np.mean(rewards)),
-            "mean_distance_m": float(np.mean(distances)),
-            "mean_angle_error_deg": float(np.mean(angle_errors)),
-        }
+    def evaluate(self):
+        per_mode={}; all_rewards=[]; all_steps=[]; total_success=total_collision=total_outside=total_timeout=0; count=0
+        for mode,env in self.envs.items():
+            success=collision=outside=timeout=0; rewards=[]; steps=[]; distances=[]; angles=[]
+            for ep in range(self.n_ep):
+                obs,_=env.reset(seed=200000+self.num_timesteps+MODE_SEED[mode]*1000+ep)
+                terminated=truncated=False; total_reward=0.0; info={}
+                while not (terminated or truncated):
+                    action,_=self.model.predict(obs,deterministic=True)
+                    obs,r,terminated,truncated,info=env.step(action); total_reward+=float(r)
+                success+=int(info["success"]); collision+=int(info["collision"]); outside+=int(info["outside_bounds"]); timeout+=int(info["timeout"])
+                rewards.append(total_reward); steps.append(info["steps"]); distances.append(info["distance"]); angles.append(info["angle_error_deg"])
+            denom=self.n_ep
+            per_mode[mode]={"episodes":denom,"success_rate":success/denom,"collision_rate":collision/denom,
+                            "outside_bounds_rate":outside/denom,"timeout_rate":timeout/denom,
+                            "mean_reward":float(np.mean(rewards)),"mean_steps":float(np.mean(steps)),
+                            "mean_distance_m":float(np.mean(distances)),"mean_angle_error_deg":float(np.mean(angles))}
+            total_success+=success; total_collision+=collision; total_outside+=outside; total_timeout+=timeout; count+=denom
+            all_rewards+=rewards; all_steps+=steps
+        result={"timesteps":int(self.num_timesteps),"episodes":count,
+                "success_rate":total_success/count,"collision_rate":total_collision/count,
+                "outside_bounds_rate":total_outside/count,"timeout_rate":total_timeout/count,
+                "mean_reward":float(np.mean(all_rewards)),"mean_steps":float(np.mean(all_steps)),
+                "worst_mode_success_rate":min(v["success_rate"] for v in per_mode.values()),"per_mode":per_mode}
         return result
-
-    def _on_step(self) -> bool:
-        if self.n_calls % self.eval_freq != 0:
-            return True
-        self.eval_calls += 1
-        metrics = self.evaluate()
-        self.logger.record("eval/success_rate", metrics["success_rate"])
-        self.logger.record("eval/collision_rate", metrics["collision_rate"])
-        self.logger.record("eval/mean_reward", metrics["mean_reward"])
-        self.logger.record("eval/mean_distance_m", metrics["mean_distance_m"])
-
-        key = (
-            metrics["success_rate"],
-            -metrics["collision_rate"],
-            -metrics["outside_rate"],
-            metrics["mean_reward"],
-        )
-        improved = key > self.best_key
+    def _on_step(self):
+        if self.n_calls%self.eval_freq: return True
+        result=self.evaluate(); key=(result["success_rate"],result["worst_mode_success_rate"],
+                                     -result["collision_rate"]-result["outside_bounds_rate"],result["mean_reward"])
+        improved=key>self.best_key
         if improved:
-            self.best_key = key
-            self.best_model_path.parent.mkdir(parents=True, exist_ok=True)
-            self.model.save(str(self.best_model_path))
-            metrics["saved_as_best"] = 1.0
-            self.best_metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-        else:
-            metrics["saved_as_best"] = 0.0
+            self.best_key=key; self.best_path.parent.mkdir(parents=True,exist_ok=True); self.model.save(str(self.best_path))
+            (ROOT/"reports"/"training"/"best_model_metrics.json").write_text(json.dumps(result,indent=2),encoding="utf-8")
+        self.log_path.parent.mkdir(parents=True,exist_ok=True)
+        with self.log_path.open("a",encoding="utf-8") as f: f.write(json.dumps(result,ensure_ascii=False)+"\n")
+        print(f"\nEval @ {self.num_timesteps:,}: success={result['success_rate']:.1%}, worst-mode={result['worst_mode_success_rate']:.1%}, "
+              f"collision={result['collision_rate']:.1%}, outside={result['outside_bounds_rate']:.1%}"+(" | NEW BEST" if improved else ""))
+        for mode,metrics in result["per_mode"].items(): print(f"  {mode:14s}: {metrics['success_rate']:.1%} success / {metrics['collision_rate']:.1%} collision")
+        return True
+    def close(self):
+        for env in self.envs.values(): env.close()
 
-        self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.metrics_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(metrics, ensure_ascii=False) + "\n")
-        if self.verbose:
-            suffix = " | NEW BEST" if improved else ""
-            print(
-                "\nEval @ {:,}: success={:.1%}, collision={:.1%}, timeout={:.1%}, "
-                "dist={:.2f}m, angle={:.1f}deg{}".format(
-                    metrics["timesteps"],
-                    metrics["success_rate"],
-                    metrics["collision_rate"],
-                    metrics["timeout_rate"],
-                    metrics["mean_distance_m"],
-                    metrics["mean_angle_error_deg"],
-                    suffix,
-                )
-            )
+MODE_SEED={m:i+1 for i,m in enumerate(MODES)}
+
+class CheckpointCallback(BaseCallback):
+    def __init__(self,directory:Path,frequency:int):
+        super().__init__(verbose=1); self.directory=directory; self.frequency=max(1,frequency)
+    def _on_step(self):
+        if self.n_calls%self.frequency==0:
+            self.directory.mkdir(parents=True,exist_ok=True); path=self.directory/f"ppo_step_{self.num_timesteps}.zip"
+            self.model.save(str(path)); print(f"\nCheckpoint saved: {path}")
         return True
 
 
-class PeriodicCheckpointCallback(BaseCallback):
-    def __init__(self, directory: Path, algorithm: str, frequency: int, verbose: int = 0):
-        super().__init__(verbose)
-        self.directory = directory
-        self.algorithm = algorithm
-        self.frequency = max(1, int(frequency))
-
-    def _on_step(self) -> bool:
-        if self.n_calls % self.frequency == 0:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            path = self.directory / f"{self.algorithm}_step_{self.num_timesteps:,}".replace(",", "")
-            self.model.save(str(path))
-            if self.verbose:
-                print(f"\nCheckpoint saved: {path}.zip")
-        return True
+def evaluate_initial_policy(model,episodes:int=12):
+    results={}
+    for mode in MODES:
+        env=ParkingEnv(mode=mode,difficulty=.62); wins=coll=out=0
+        for ep in range(episodes):
+            obs,_=env.reset(seed=300000+MODE_SEED[mode]*100+ep); term=trunc=False; info={}
+            while not(term or trunc):
+                action,_=model.predict(obs,deterministic=True); obs,_,term,trunc,info=env.step(action)
+            wins+=int(info["success"]); coll+=int(info["collision"]); out+=int(info["outside_bounds"])
+        results[mode]={"success_rate":wins/episodes,"collision_rate":coll/episodes,"outside_bounds_rate":out/episodes}
+        env.close()
+    return results
 
 
-def evaluate_model(
-    model: Any,
-    env: ParkingEnv,
-    episodes: int,
-    seed: int,
-) -> dict[str, float]:
-    successes = collisions = outside = 0
-    rewards: list[float] = []
-    distances: list[float] = []
-    angles: list[float] = []
-    for episode in range(episodes):
-        obs, _ = env.reset(seed=seed + episode)
-        terminated = truncated = False
-        total_reward = 0.0
-        info: dict[str, Any] = {}
-        while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += float(reward)
-        successes += int(bool(info.get("success")))
-        collisions += int(bool(info.get("collision")))
-        outside += int(bool(info.get("outside_bounds")))
-        rewards.append(total_reward)
-        distances.append(float(info["distance"]))
-        angles.append(float(info["angle_error_deg"]))
-    return {
-        "episodes": float(episodes),
-        "success_rate": successes / episodes,
-        "collision_rate": collisions / episodes,
-        "outside_rate": outside / episodes,
-        "timeout_rate": max(0.0, 1.0 - (successes + collisions + outside) / episodes),
-        "mean_reward": float(np.mean(rewards)),
-        "mean_distance_m": float(np.mean(distances)),
-        "mean_angle_error_deg": float(np.mean(angles)),
-    }
+def parse_args():
+    p=argparse.ArgumentParser(description="AutoPark v0.4: multi-mode expert BC + PPO")
+    p.add_argument("--timesteps",type=int,default=3_000_000)
+    p.add_argument("--demo-episodes",type=int,default=1200)
+    p.add_argument("--bc-epochs",type=int,default=30)
+    p.add_argument("--eval-freq",type=int,default=50_000)
+    p.add_argument("--eval-episodes",type=int,default=12,help="Evaluation episodes per parking mode")
+    p.add_argument("--checkpoint-freq",type=int,default=250_000)
+    p.add_argument("--seed",type=int,default=42)
+    p.add_argument("--device",choices=("cpu","cuda","auto"),default="cpu")
+    p.add_argument("--resume",action="store_true")
+    p.add_argument("--skip-pretraining",action="store_true")
+    return p.parse_args()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="AutoPark v0.3: expert behavior cloning + PPO/SAC fine-tuning"
-    )
-    parser.add_argument("--algorithm", choices=("ppo", "sac"), default="ppo")
-    parser.add_argument("--timesteps", type=int, default=2_000_000)
-    parser.add_argument("--demo-episodes", type=int, default=900)
-    parser.add_argument("--bc-epochs", type=int, default=35)
-    parser.add_argument("--eval-freq", type=int, default=40_000)
-    parser.add_argument("--eval-episodes", type=int, default=24)
-    parser.add_argument("--checkpoint-freq", type=int, default=200_000)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
-    parser.add_argument("--resume", action="store_true", help="Continue from models/final_model.zip")
-    parser.add_argument("--skip-pretraining", action="store_true", help="Start RL without BC initialization")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    if args.timesteps < 1:
-        raise SystemExit("--timesteps must be positive")
-    if args.demo_episodes < 1 and not args.skip_pretraining and not args.resume:
-        raise SystemExit("--demo-episodes must be positive")
-
-    torch.set_num_threads(1)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    models_dir = ROOT / "models"
-    reports_dir = ROOT / "reports" / "training"
-    best_path = models_dir / "best_model.zip"
-    final_path = models_dir / "final_model.zip"
-    for directory in (models_dir, reports_dir, ROOT / "reports" / "tensorboard", models_dir / "checkpoints"):
-        directory.mkdir(parents=True, exist_ok=True)
-    if not args.resume:
-        for stale_log in (
-            reports_dir / "success_evaluations.jsonl",
-            reports_dir / "best_model_metrics.json",
-        ):
-            stale_log.unlink(missing_ok=True)
-
-    base_env = ParkingEnv(difficulty=0.10)
-    train_env = Monitor(base_env)
-    eval_env = ParkingEnv(difficulty=0.58)
-
-    if args.algorithm == "ppo":
-        ModelClass = PPO
-        policy_kwargs = {
-            "net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]},
-            "activation_fn": torch.nn.Tanh,
-        }
-    else:
-        ModelClass = SAC
-        policy_kwargs = {
-            "net_arch": [256, 256, 128],
-            "activation_fn": torch.nn.Tanh,
-        }
-
+def main():
+    args=parse_args()
+    if min(args.timesteps,args.eval_freq,args.eval_episodes,args.checkpoint_freq)<1: raise SystemExit("All training counts must be positive")
+    if args.demo_episodes<1 and not(args.skip_pretraining or args.resume): raise SystemExit("--demo-episodes must be positive")
+    torch.set_num_threads(1); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    models=ROOT/"models"; reports=ROOT/"reports"/"training"
+    models.mkdir(exist_ok=True); reports.mkdir(parents=True,exist_ok=True)
+    best_path=models/"best_model.zip"; final_path=models/"final_model.zip"
+    base_env=ParkingEnv(mode="mixed",difficulty=.08)
+    train_env=Monitor(base_env)
+    policy_kwargs={"net_arch":{"pi":[256,256,128],"vf":[256,256,128]},"activation_fn":torch.nn.Tanh}
+    bc_stats=None; bc_metrics=None
     if args.resume:
-        if not final_path.exists():
-            raise FileNotFoundError(f"Cannot resume; missing {final_path}")
-        print(f"Resuming {args.algorithm.upper()} from {final_path}")
-        model = ModelClass.load(str(final_path), env=train_env, device=args.device)
+        if not final_path.exists(): raise FileNotFoundError(f"Missing {final_path}")
+        model=PPO.load(str(final_path),env=train_env,device=args.device)
+        print(f"Resuming PPO from {final_path}")
     else:
+        actor=None
         if not args.skip_pretraining:
-            print("\n[1/4] Collecting expert parking demonstrations...")
-            demo_env = ParkingEnv(difficulty=0.25)
-            demo_obs, demo_actions, demo_stats = collect_expert_demonstrations(
-                demo_env,
-                episodes=args.demo_episodes,
-                seed=args.seed,
-            )
-            save_demonstrations(
-                reports_dir / "expert_demonstrations.npz",
-                demo_obs,
-                demo_actions,
-                demo_stats,
-            )
-            (reports_dir / "expert_demonstrations.json").write_text(
-                json.dumps(demo_stats, indent=2), encoding="utf-8"
-            )
-            print(f"Expert success rate: {demo_stats['expert_success_rate']:.1%}")
-            if demo_stats["expert_success_rate"] < 0.90:
-                raise RuntimeError(
-                    "Expert baseline success rate is below 90%; refusing to train on weak demonstrations."
-                )
-
-            print("\n[2/4] Behavior cloning pretraining...")
-            bc_actor, bc_metrics = train_behavior_cloning(
-                demo_obs,
-                demo_actions,
-                algorithm=args.algorithm,
-                epochs=args.bc_epochs,
-                device="cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu",
-                seed=args.seed,
-            )
-            torch.save(bc_actor.state_dict(), models_dir / "bc_actor.pt")
-            (reports_dir / "behavior_cloning.json").write_text(
-                json.dumps({**demo_stats, **bc_metrics}, indent=2), encoding="utf-8"
-            )
-        else:
-            bc_actor = None
-
-        print("\n[3/4] Initializing RL model...")
-        if args.algorithm == "ppo":
-            model = PPO(
-                "MlpPolicy",
-                train_env,
-                learning_rate=1.0e-4,
-                n_steps=2048,
-                batch_size=512,
-                n_epochs=6,
-                gamma=0.995,
-                gae_lambda=0.95,
-                clip_range=0.15,
-                ent_coef=0.003,
-                vf_coef=0.5,
-                max_grad_norm=0.5,
-                policy_kwargs=policy_kwargs,
-                tensorboard_log=str(ROOT / "reports" / "tensorboard"),
-                verbose=1,
-                seed=args.seed,
-                device=args.device,
-            )
-        else:
-            model = SAC(
-                "MlpPolicy",
-                train_env,
-                learning_rate=3.0e-4,
-                buffer_size=500_000,
-                learning_starts=1_000,
-                batch_size=256,
-                tau=0.005,
-                gamma=0.99,
-                train_freq=(1, "step"),
-                gradient_steps=1,
-                ent_coef="auto_0.1",
-                policy_kwargs=policy_kwargs,
-                tensorboard_log=str(ROOT / "reports" / "tensorboard"),
-                verbose=1,
-                seed=args.seed,
-                device=args.device,
-            )
-        if bc_actor is not None:
-            initialize_sb3_actor(model, bc_actor, args.algorithm)
-            print("Behavior-cloned actor weights copied into RL policy.")
-
-        print("\n[4/4] Measuring the initialized policy on unseen parking maps...")
-        baseline = evaluate_model(model, eval_env, episodes=100, seed=120_000)
-        print(json.dumps(baseline, indent=2))
+            print("\n[1/4] Collecting balanced expert demonstrations for four modes...")
+            demo_env=ParkingEnv(mode="mixed",difficulty=.25)
+            obs,acts,bc_stats=collect_expert_demonstrations(demo_env,args.demo_episodes,args.seed)
+            demo_env.close()
+            save_demonstrations(reports/"expert_demonstrations.npz",obs,acts)
+            (reports/"expert_demonstrations.json").write_text(json.dumps(bc_stats,indent=2),encoding="utf-8")
+            print(f"Expert success: {bc_stats['expert_success_rate']:.1%}; transitions={len(obs):,}")
+            weak=[m for m,v in bc_stats["per_mode"].items() if v["success_rate"]<.85]
+            if bc_stats["expert_success_rate"]<.90 or weak:
+                raise RuntimeError(f"Expert demonstrations are too weak; per-mode failures: {weak}. Refusing to start RL.")
+            print("\n[2/4] Behavior Cloning pretraining...")
+            actor,bc_metrics=train_behavior_cloning(obs,acts,args.bc_epochs,device=("cuda" if args.device=="cuda" and torch.cuda.is_available() else "cpu"),seed=args.seed)
+            torch.save(actor.state_dict(),models/"bc_actor.pt")
+            (reports/"behavior_cloning.json").write_text(json.dumps({**bc_stats,**bc_metrics},indent=2),encoding="utf-8")
+        print("\n[3/4] Initializing PPO policy...")
+        model=PPO("MlpPolicy",train_env,learning_rate=1.0e-4,n_steps=2048,batch_size=512,n_epochs=6,
+                  gamma=.995,gae_lambda=.95,clip_range=.15,ent_coef=.002,vf_coef=.5,max_grad_norm=.5,
+                  policy_kwargs=policy_kwargs,tensorboard_log=str(ROOT/"reports"/"tensorboard"),verbose=1,
+                  seed=args.seed,device=args.device)
+        if actor is not None: initialize_ppo_actor(model,actor); print("BC actor weights copied to PPO policy.")
+        print("\n[4/4] Measuring BC-initialized policy on all four modes...")
+        baseline=evaluate_initial_policy(model,episodes=20)
+        (reports/"bc_baseline_by_mode.json").write_text(json.dumps(baseline,indent=2),encoding="utf-8")
+        print(json.dumps(baseline,indent=2))
+        # Always preserve the initialized baseline as the first candidate.
         model.save(str(best_path))
-        baseline_with_time = {"timesteps": 0, **baseline, "saved_as_best": 1.0}
-        (reports_dir / "best_model_metrics.json").write_text(
-            json.dumps(baseline_with_time, indent=2), encoding="utf-8"
-        )
-        (reports_dir / "bc_baseline_evaluation.json").write_text(
-            json.dumps(baseline, indent=2), encoding="utf-8"
-        )
-
-    eval_callback = SuccessAwareEvalCallback(
-        eval_env,
-        best_path,
-        eval_freq=args.eval_freq,
-        episodes=args.eval_episodes,
-        verbose=1,
-    )
-    callbacks = CallbackList(
-        [
-            eval_callback,
-            CurriculumCallback(base_env, args.timesteps, verbose=1),
-            PeriodicCheckpointCallback(
-                models_dir / "checkpoints", args.algorithm, args.checkpoint_freq, verbose=1
-            ),
-        ]
-    )
-
-    metadata = {
-        "version": "0.3",
-        "algorithm": args.algorithm,
-        "observation_size": ParkingEnv.OBSERVATION_SIZE,
-        "action_size": 2,
-        "behavior_cloning": not args.skip_pretraining,
-        "expert_demo_episodes": args.demo_episodes if not args.skip_pretraining else 0,
-        "timesteps_requested": args.timesteps,
-        "seed": args.seed,
-    }
-    (models_dir / "model_metadata.json").write_text(
-        json.dumps(metadata, indent=2), encoding="utf-8"
-    )
-
-    print("\n" + "=" * 76)
-    print(f"AUTOPARK RL v0.3 | {args.algorithm.upper()} + BEHAVIOR CLONING")
-    print(f"RL timesteps       : {args.timesteps:,}")
-    print(f"Expert episodes    : {metadata['expert_demo_episodes']:,}")
-    print(f"Evaluation          : every {args.eval_freq:,} steps / {args.eval_episodes} episodes")
-    print("Parking bays        : 12 with obstacle-aware bay selection")
-    print("Selection criterion : success rate, then collision/outside rates, then reward")
-    print(f"Device              : {args.device}")
-    print("=" * 76)
-    print("Training begins. Best model is selected by completed parking rate, not reward alone.\n")
-
+        avg=float(np.mean([v["success_rate"] for v in baseline.values()]))
+        (reports/"best_model_metrics.json").write_text(json.dumps({"timesteps":0,"success_rate":avg,"per_mode":baseline},indent=2),encoding="utf-8")
+    eval_cb=SuccessAwareEvalCallback(args.eval_freq,args.eval_episodes,best_path)
+    callbacks=CallbackList([eval_cb,CurriculumCallback(base_env,args.timesteps),CheckpointCallback(models/"checkpoints",args.checkpoint_freq)])
+    metadata={"version":"0.4.0","algorithm":"PPO","observation_size":ParkingEnv.OBSERVATION_SIZE,
+              "action_size":2,"modes":list(MODES),"sensor_suite":{"lidar_rays":16,"ultrasonic":4,"camera":"semantic RGB + bay occupancy segmentation"},
+              "behavior_cloning":not args.skip_pretraining,"expert_demo_episodes":args.demo_episodes if not args.skip_pretraining else 0,
+              "requested_rl_timesteps":args.timesteps,"seed":args.seed}
+    (models/"model_metadata.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
+    print("\n"+"="*78); print("AUTOPARK RL v0.4 | BC + PPO | FOUR PARKING MODES")
+    print(f"RL timesteps       : {args.timesteps:,}"); print(f"Expert demos       : {metadata['expert_demo_episodes']:,}")
+    print(f"Modes              : {', '.join(MODES)}"); print("Sensors            : 16-ray LiDAR + 4 ultrasonic + RGB camera perception")
+    print(f"Evaluation         : every {args.eval_freq:,} steps / {args.eval_episodes} episodes per mode")
+    print("Model selection    : aggregate success -> worst-mode success -> safety -> reward")
+    print(f"Device             : {args.device}"); print("="*78)
     try:
-        model.learn(
-            total_timesteps=args.timesteps,
-            callback=callbacks,
-            progress_bar=True,
-            reset_num_timesteps=not args.resume,
-            tb_log_name=f"autopark_v03_{args.algorithm}",
-        )
+        model.learn(total_timesteps=args.timesteps,callback=callbacks,progress_bar=True,
+                    reset_num_timesteps=not args.resume,tb_log_name="autopark_v04_ppo_multimode")
     except KeyboardInterrupt:
-        print("\nTraining interrupted; saving current policy...")
+        print("\nTraining interrupted; saving the latest policy and checkpoints.")
     finally:
-        model.save(str(final_path))
-        train_env.close()
-        eval_env.close()
-        print(f"\nFinal model: {final_path}")
-        print(f"Best model : {best_path}")
-        print(f"Metadata   : {models_dir / 'model_metadata.json'}")
+        model.save(str(final_path)); base_env.close(); eval_cb.close()
+        print(f"\nFinal model: {final_path}\nBest model : {best_path}\nMetadata   : {models/'model_metadata.json'}")
 
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()

@@ -1,0 +1,22 @@
+{
+  "perpendicular": {
+    "success_rate": 0.0,
+    "collision_rate": 0.0,
+    "outside_bounds_rate": 0.05
+  },
+  "reverse": {
+    "success_rate": 0.8,
+    "collision_rate": 0.0,
+    "outside_bounds_rate": 0.05
+  },
+  "parallel": {
+    "success_rate": 0.0,
+    "collision_rate": 0.0,
+    "outside_bounds_rate": 0.0
+  },
+  "tight": {
+    "success_rate": 0.15,
+    "collision_rate": 0.0,
+    "outside_bounds_rate": 0.25
+  }
+}
