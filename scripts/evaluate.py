@@ -1,149 +1,91 @@
-"""Evaluate an AutoPark PPO/SAC policy or the built-in expert controller."""
-
+"""Evaluate PPO or the expert baseline on each parking mode with reports."""
 from __future__ import annotations
-
-import argparse
-import csv
-import json
-import sys
+import argparse,csv,json,sys
 from collections import Counter
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
-import matplotlib
-matplotlib.use("Agg")
+ROOT=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(ROOT/"src"))
+import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from stable_baselines3 import PPO, SAC
-
-from autopark.environment import ParkingEnv
-
-
-def resolve_model(path_text: str | None) -> Path:
-    if path_text:
-        path = Path(path_text)
-        return path if path.is_absolute() else ROOT / path
-    candidates = [ROOT / "models" / "best_model.zip", ROOT / "models" / "final_model.zip"]
-    for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError("No model found. Train first or pass --model PATH")
+from stable_baselines3 import PPO
+from autopark.environment import ParkingEnv,MODES
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate AutoPark v0.3")
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--algorithm", choices=("ppo", "sac"), default="ppo")
-    parser.add_argument("--expert", action="store_true", help="Evaluate the rule-based expert baseline")
-    parser.add_argument("--episodes", type=int, default=200)
-    parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--difficulty", type=float, default=0.58)
-    args = parser.parse_args()
-    if args.episodes < 1:
-        raise SystemExit("--episodes must be positive")
-
-    model = None
-    model_label = "expert_controller"
+def main():
+    p=argparse.ArgumentParser(description="AutoPark v0.4 four-mode evaluation")
+    p.add_argument("--model",default="models/best_model.zip")
+    p.add_argument("--expert",action="store_true")
+    p.add_argument("--episodes",type=int,default=200,help="Episodes per mode when --mode all")
+    p.add_argument("--mode",choices=("all",*MODES),default="all")
+    p.add_argument("--difficulty",type=float,default=.62)
+    p.add_argument("--seed",type=int,default=2026)
+    args=p.parse_args()
+    if args.episodes<1: raise SystemExit("--episodes must be positive")
+    model=None; model_label="expert_controller"
     if not args.expert:
-        model_path = resolve_model(args.model)
-        model_cls = PPO if args.algorithm == "ppo" else SAC
-        model = model_cls.load(str(model_path), device="auto")
-        model_label = str(model_path.relative_to(ROOT)) if model_path.is_relative_to(ROOT) else str(model_path)
+        path=Path(args.model); path=path if path.is_absolute() else ROOT/path
+        if not path.exists(): raise FileNotFoundError(f"Model not found: {path}. Train first or use --expert.")
+        model=PPO.load(str(path),device="auto"); model_label=str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+    modes=MODES if args.mode=="all" else (args.mode,)
+    per_mode={}; all_rows=[]
+    for mode_idx,mode in enumerate(modes):
+        env=ParkingEnv(mode=mode,difficulty=args.difficulty); rows=[]; slot_counts=Counter()
+        for ep in range(args.episodes):
+            obs,_=env.reset(seed=args.seed+mode_idx*100000+ep); terminated=truncated=False; total_reward=0.0; info={}
+            while not(terminated or truncated):
+                action=env.expert_action() if args.expert else model.predict(obs,deterministic=True)[0]
+                obs,reward,terminated,truncated,info=env.step(action); total_reward+=float(reward)
+            slot_counts[str(info["target_slot"])]+=1
+            row={"mode":mode,"episode":ep+1,"target_slot":info["target_slot"],"success":info["success"],
+                 "collision":info["collision"],"outside_bounds":info["outside_bounds"],"timeout":info["timeout"],
+                 "steps":info["steps"],"distance_m":info["distance"],"angle_error_deg":info["angle_error_deg"],
+                 "reward":total_reward,"camera_occupied_detected":info["camera_detected_occupied"],
+                 "ground_truth_occupied":info["ground_truth_occupied"],"camera_occupancy_match":info["camera_occupancy_match"]}
+            rows.append(row); all_rows.append(row)
+            if (ep+1)%max(1,min(50,args.episodes//4))==0 or ep+1==args.episodes:
+                print(f"{mode}: evaluated {ep+1}/{args.episodes}")
+        # Mutually-exclusive outcomes; rates must sum to 100% (within FP tolerance).
+        per_mode[mode]={"episodes":len(rows),"success_rate":float(np.mean([r["success"] for r in rows])),
+                        "collision_rate":float(np.mean([r["collision"] for r in rows])),
+                        "outside_bounds_rate":float(np.mean([r["outside_bounds"] for r in rows])),
+                        "timeout_rate":float(np.mean([r["timeout"] for r in rows])),
+                        "mean_steps":float(np.mean([r["steps"] for r in rows])),
+                        "mean_final_distance_m":float(np.mean([r["distance_m"] for r in rows])),
+                        "mean_final_angle_error_deg":float(np.mean([r["angle_error_deg"] for r in rows])),
+                        "mean_reward":float(np.mean([r["reward"] for r in rows])),
+                        "camera_occupancy_match_rate":float(np.mean([r["camera_occupancy_match"] for r in rows])),
+                        "selected_bay_counts":dict(slot_counts)}
+        env.close()
+        print(f"\n{mode.upper()}: success={per_mode[mode]['success_rate']:.1%}; collision={per_mode[mode]['collision_rate']:.1%}; "
+              f"outside={per_mode[mode]['outside_bounds_rate']:.1%}; timeout={per_mode[mode]['timeout_rate']:.1%}")
+    total=len(all_rows)
+    overall={key:float(np.mean([r[field] for r in all_rows])) for key,field in (
+        ("success_rate","success"),("collision_rate","collision"),("outside_bounds_rate","outside_bounds"),("timeout_rate","timeout"),
+        ("mean_steps","steps"),("mean_final_distance_m","distance_m"),("mean_final_angle_error_deg","angle_error_deg"),("mean_reward","reward"))}
+    overall.update({"model":model_label,"mode":args.mode,"episodes":total,"episodes_per_mode":args.episodes if args.mode=="all" else None,
+                    "difficulty":args.difficulty,"per_mode":per_mode})
+    out=ROOT/"reports"/"evaluation"; fig_dir=ROOT/"reports"/"figures"; out.mkdir(parents=True,exist_ok=True); fig_dir.mkdir(parents=True,exist_ok=True)
+    csv_path=out/("expert_episodes.csv" if args.expert else "episodes.csv")
+    with csv_path.open("w",newline="",encoding="utf-8") as f:
+        writer=csv.DictWriter(f,fieldnames=list(all_rows[0].keys())); writer.writeheader(); writer.writerows(all_rows)
+    (out/"summary_by_mode.json").write_text(json.dumps(overall,indent=2),encoding="utf-8")
+    (out/("expert_summary.json" if args.expert else "summary.json")).write_text(json.dumps(overall,indent=2),encoding="utf-8")
+    labels=list(per_mode)
+    if labels:
+        series=[("Success","success_rate"),("Collision","collision_rate"),("Outside","outside_bounds_rate"),("Timeout","timeout_rate")]
+        fig,ax=plt.subplots(figsize=(10,5.5)); x=np.arange(len(labels)); width=.18
+        for i,(name,key) in enumerate(series):
+            vals=[per_mode[m][key]*100 for m in labels]
+            bars=ax.bar(x+(i-1.5)*width,vals,width,label=name)
+            for b,v in zip(bars,vals):
+                if v>=3: ax.text(b.get_x()+b.get_width()/2,v+1,f"{v:.0f}%",ha="center",va="bottom",fontsize=8)
+        ax.set_xticks(x,labels); ax.set_ylim(0,110); ax.set_ylabel("Episodes (%)")
+        ax.set_title(f"AutoPark v0.4 — {model_label} — {total} evaluation episodes")
+        ax.grid(axis="y",alpha=.25); ax.legend(ncols=4); fig.tight_layout()
+        chart=fig_dir/("expert_evaluation_v04.png" if args.expert else "evaluation_v04.png"); fig.savefig(chart,dpi=180); plt.close(fig)
+    else: chart=None
+    print("\nOverall evaluation summary")
+    print(json.dumps(overall,indent=2))
+    print(f"\nCSV: {csv_path}\nSummary: {out/'summary_by_mode.json'}\nChart: {chart}")
 
-    env = ParkingEnv(difficulty=args.difficulty)
-    rows: list[dict[str, object]] = []
-    selected_slots: Counter[str] = Counter()
-
-    for episode in range(args.episodes):
-        obs, reset_info = env.reset(seed=args.seed + episode)
-        total_reward = 0.0
-        terminated = truncated = False
-        info = reset_info
-        while not (terminated or truncated):
-            action = env.expert_action() if args.expert else model.predict(obs, deterministic=True)[0]
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += float(reward)
-
-        selected_slots[str(info["target_slot"])] += 1
-        rows.append({
-            "episode": episode + 1,
-            "target_slot": info["target_slot"],
-            "free_slots": info["free_slots"],
-            "feasible_slots": info["feasible_slots"],
-            "occupied_slots": info["occupied_slots"],
-            "success": bool(info["success"]),
-            "collision": bool(info["collision"]),
-            "outside_bounds": bool(info["outside_bounds"]),
-            "steps": int(info["steps"]),
-            "distance_m": float(info["distance"]),
-            "angle_error_deg": float(info["angle_error_deg"]),
-            "bearing_error_deg": float(info["bearing_error_deg"]),
-            "total_reward": total_reward,
-        })
-        if (episode + 1) % 20 == 0 or episode + 1 == args.episodes:
-            print(f"Evaluated {episode + 1}/{args.episodes} episodes")
-
-    env.close()
-    out_dir = ROOT / "reports" / "evaluation"
-    fig_dir = ROOT / "reports" / "figures"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_path = out_dir / ("expert_episodes.csv" if args.expert else "episodes.csv")
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
-    success_rate = float(np.mean([bool(row["success"]) for row in rows]))
-    collision_rate = float(np.mean([bool(row["collision"]) for row in rows]))
-    outside_rate = float(np.mean([bool(row["outside_bounds"]) for row in rows]))
-    summary = {
-        "model": model_label,
-        "mode": "expert" if args.expert else args.algorithm,
-        "episodes": args.episodes,
-        "difficulty": args.difficulty,
-        "success_rate": success_rate,
-        "collision_rate": collision_rate,
-        "outside_bounds_rate": outside_rate,
-        "timeout_rate": max(0.0, 1.0 - success_rate - collision_rate - outside_rate),
-        "mean_steps": float(np.mean([int(row["steps"]) for row in rows])),
-        "mean_final_distance_m": float(np.mean([float(row["distance_m"]) for row in rows])),
-        "mean_final_angle_error_deg": float(np.mean([float(row["angle_error_deg"]) for row in rows])),
-        "mean_reward": float(np.mean([float(row["total_reward"]) for row in rows])),
-        "selected_bay_counts": dict(selected_slots),
-    }
-    summary_path = out_dir / ("expert_summary.json" if args.expert else "summary.json")
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    labels = ["Success", "Collision", "Outside", "Timeout"]
-    values = [
-        success_rate * 100,
-        collision_rate * 100,
-        outside_rate * 100,
-        max(0.0, 100.0 * (1.0 - success_rate - collision_rate - outside_rate)),
-    ]
-    fig, ax = plt.subplots(figsize=(8.5, 4.8))
-    bars = ax.bar(labels, values)
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("Episodes (%)")
-    ax.set_title(f"AutoPark v0.3 {'expert' if args.expert else args.algorithm.upper()} — {args.episodes} maps")
-    ax.grid(axis="y", alpha=0.25)
-    for bar, value in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, value + 1, f"{value:.1f}%", ha="center")
-    fig.tight_layout()
-    chart_path = fig_dir / ("expert_evaluation.png" if args.expert else "evaluation_results.png")
-    fig.savefig(chart_path, dpi=170)
-    plt.close(fig)
-
-    print("\nEvaluation summary")
-    print(json.dumps(summary, indent=2))
-    print(f"\nCSV:     {csv_path}")
-    print(f"Summary: {summary_path}")
-    print(f"Chart:   {chart_path}")
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()

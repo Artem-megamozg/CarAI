@@ -1,10 +1,21 @@
 {
-  "version": "0.3",
-  "algorithm": "ppo",
-  "observation_size": 48,
+  "version": "0.4.0",
+  "algorithm": "PPO",
+  "observation_size": 75,
   "action_size": 2,
+  "modes": [
+    "perpendicular",
+    "reverse",
+    "parallel",
+    "tight"
+  ],
+  "sensor_suite": {
+    "lidar_rays": 16,
+    "ultrasonic": 4,
+    "camera": "semantic RGB + bay occupancy segmentation"
+  },
   "behavior_cloning": true,
-  "expert_demo_episodes": 900,
-  "timesteps_requested": 2000000,
+  "expert_demo_episodes": 1200,
+  "requested_rl_timesteps": 3000000,
   "seed": 42
 }

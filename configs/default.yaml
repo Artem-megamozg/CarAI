@@ -1,34 +1,40 @@
 project: AutoPark RL
-version: 0.3.0
+version: 0.4.0
+algorithm: PPO
+modes:
+  - perpendicular
+  - reverse
+  - parallel
+  - tight
 simulation:
-  arena_width: 20.0
-  arena_height: 15.0
-  slot_rows: 2
-  slot_columns: 6
-  max_episode_steps: 500
-  dt: 0.1
-  observation_size: 48
+  arena_width_m: 24.0
+  arena_height_m: 18.0
+  lane_y_m: 9.0
+  timestep_s: 0.1
+  max_episode_steps: 650
+  observation_size: 75
+sensors:
+  lidar_rays: 16
+  lidar_max_range_m: 8.0
+  ultrasonic_directions: [front, rear, left, right]
+  ultrasonic_max_range_m: 4.0
+  virtual_camera: [288, 216]
+  camera_perception: semantic_blue_vehicle_segmentation
 training:
-  default_algorithm: PPO
-  alternative_algorithm: SAC
-  default_rl_timesteps: 2000000
-  expert_demo_episodes: 900
-  behavior_cloning_epochs: 35
-  initial_occupied_probability: 0.14
-  final_occupied_probability: 0.332
-  evaluation_episodes: 24
-  evaluation_frequency: 40000
-  checkpoint_frequency: 200000
+  rl_timesteps: 3000000
+  expert_demo_episodes: 1200
+  behavior_cloning_epochs: 30
+  evaluation_frequency: 50000
+  evaluation_episodes_per_mode: 12
+  checkpoint_frequency: 250000
+  curriculum_difficulty: [0.08, 0.62]
 model_selection:
-  primary_metric: success_rate
-  tie_breakers:
-    - collision_rate
-    - outside_bounds_rate
-    - mean_reward
+  primary_metric: aggregate_success_rate
+  tie_breakers: [worst_mode_success_rate, collision_and_outside_rates, mean_reward]
 vehicle:
   model: kinematic_bicycle
   length_m: 4.2
   width_m: 1.8
   wheelbase_m: 2.65
-  max_speed_mps: 3.0
+  max_speed_mps: 2.2
   max_steering_deg: 34.0

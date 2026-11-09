@@ -1,202 +1,91 @@
-"""Pygame renderer for the multi-bay AutoPark scene."""
-
+"""Pygame visualizer for vehicle, parking modes, camera and sensor overlays."""
 from __future__ import annotations
-
 import math
-from typing import Iterable
-
 import pygame
-
-from autopark.environment.parking_env import ParkingEnv
-from autopark.physics import CarState, rectangle_corners
-
+from PIL import Image
+from autopark.physics import rectangle_corners
+from autopark.vision import render_camera
 
 class ParkingRenderer:
-    WIDTH = 1360
-    HEIGHT = 1000
-    SCALE = 54
-    LEFT = 100
-    TOP = 100
-
-    BG = (16, 20, 27)
-    ASPHALT = (39, 47, 58)
-    ROAD = (45, 54, 66)
-    LINE = (165, 177, 191)
-    MUTED = (151, 163, 178)
-    WHITE = (241, 245, 249)
-    GREEN = (62, 215, 151)
-    RED = (226, 91, 94)
-    YELLOW = (255, 190, 72)
-    BLUE = (83, 151, 226)
-    TEAL = (68, 177, 195)
-
-    def __init__(self, pygame_module=pygame):
-        self.pg = pygame_module
-        self.screen = self.pg.display.set_mode((self.WIDTH, self.HEIGHT))
-        self.pg.display.set_caption("AutoPark RL v0.3 | Imitation + Reinforcement Learning")
-        self.font = self.pg.font.SysFont("segoeui", 21)
-        self.small = self.pg.font.SysFont("segoeui", 16)
-        self.tiny = self.pg.font.SysFont("segoeui", 13)
-        self.large = self.pg.font.SysFont("segoeui", 31, bold=True)
-
-    def world_to_screen(self, x: float, y: float) -> tuple[int, int]:
-        return int(self.LEFT + x * self.SCALE), int(self.TOP + y * self.SCALE)
-
-    def _text(self, text: str, x: int, y: int, color=WHITE, font=None) -> None:
-        surface = (font or self.font).render(text, True, color)
-        self.screen.blit(surface, (x, y))
-
-    def _draw_car(
-        self,
-        state: CarState,
-        length: float,
-        width: float,
-        color: tuple[int, int, int],
-        label: str | None = None,
-    ) -> None:
-        corners = rectangle_corners(state.x, state.y, state.heading, length, width)
-        points = [self.world_to_screen(float(x), float(y)) for x, y in corners]
-        self.pg.draw.polygon(self.screen, color, points)
-        self.pg.draw.polygon(self.screen, (12, 17, 24), points, 3)
-
-        c, s = math.cos(state.heading), math.sin(state.heading)
-
-        def local_point(local_x: float, local_y: float) -> tuple[int, int]:
-            wx = state.x + local_x * c - local_y * s
-            wy = state.y + local_x * s + local_y * c
-            return self.world_to_screen(wx, wy)
-
-        windshield = [
-            local_point(0.18, -width * 0.37),
-            local_point(length * 0.22, -width * 0.37),
-            local_point(length * 0.22, width * 0.37),
-            local_point(0.18, width * 0.37),
-        ]
-        self.pg.draw.polygon(self.screen, (42, 61, 79), windshield)
-        self.pg.draw.polygon(self.screen, (15, 24, 34), windshield, 1)
-        self.pg.draw.circle(self.screen, (255, 232, 166), local_point(length * 0.47, 0.0), 5)
-        if label:
-            label_surface = self.tiny.render(label, True, self.WHITE)
-            label_rect = label_surface.get_rect(center=self.world_to_screen(state.x, state.y))
-            self.screen.blit(label_surface, label_rect)
-
-    def _draw_bays(self, env: ParkingEnv) -> None:
-        selected_id = env.target_slot_id
-        for record in env.slot_records:
-            x, y = float(record["x"]), float(record["y"])
-            center = self.world_to_screen(x, y)
-            width = int(env.SLOT_WIDTH * self.SCALE)
-            height = int(env.SLOT_LENGTH * self.SCALE)
-            rect = self.pg.Rect(0, 0, width, height)
-            rect.center = center
-
-            if record["occupied"]:
-                fill = (47, 66, 87)
-                border = (91, 121, 153)
-            elif not record["feasible"]:
-                fill = (66, 46, 51)
-                border = self.RED
-            elif record["id"] == selected_id:
-                fill = (76, 91, 47)
-                border = self.YELLOW
-            else:
-                fill = (35, 75, 65)
-                border = (73, 164, 128)
-
-            self.pg.draw.rect(self.screen, fill, rect, border_radius=5)
-            self.pg.draw.rect(self.screen, border, rect, 3 if record["id"] == selected_id else 2, border_radius=5)
-            label_color = self.YELLOW if record["id"] == selected_id else self.MUTED
-            self._text(record["id"], rect.left + 7, rect.top + 6, label_color, self.tiny)
-
-            if not record["occupied"] and record["feasible"] and record["id"] != selected_id:
-                self.pg.draw.circle(self.screen, self.GREEN, (rect.right - 11, rect.top + 12), 4)
-
-        # Selected spot receives a clear goal marker and arrow for final orientation.
-        selected = next(r for r in env.slot_records if r["id"] == selected_id)
-        cx, cy = self.world_to_screen(float(selected["x"]), float(selected["y"]))
-        direction = -1 if int(selected["row"]) == 0 else 1
-        end = (cx, cy + direction * 34)
-        self.pg.draw.line(self.screen, self.YELLOW, (cx, cy), end, 4)
-        self.pg.draw.circle(self.screen, self.YELLOW, (cx, cy), 7)
-
-    def draw(
-        self,
-        env: ParkingEnv,
-        *,
-        episode: int,
-        reward: float,
-        status: str,
-        trajectory: Iterable[tuple[float, float]],
-        paused: bool = False,
-        deterministic: bool = True,
-        mode: str = "PPO POLICY",
-    ) -> None:
+    WIDTH,HEIGHT=1500,980
+    LEFT,TOP,SCALE=55,65,42
+    BG=(14,19,26); ASPHALT=(34,43,54); ROAD=(48,58,70); WHITE=(239,244,249)
+    MUTED=(153,167,182); GREEN=(72,207,151); RED=(225,91,98); YELLOW=(255,193,77); BLUE=(75,145,225)
+    def __init__(self):
+        pygame.init(); self.screen=pygame.display.set_mode((self.WIDTH,self.HEIGHT))
+        pygame.display.set_caption("AutoPark RL v0.4 | Four-mode autonomous parking")
+        self.font=pygame.font.SysFont("segoeui",20); self.small=pygame.font.SysFont("segoeui",15)
+        self.tiny=pygame.font.SysFont("segoeui",12); self.large=pygame.font.SysFont("segoeui",32,bold=True)
+    def world(self,x,y): return int(self.LEFT+x*self.SCALE),int(self.TOP+y*self.SCALE)
+    def text(self,s,x,y,color=None,font=None):
+        self.screen.blit((font or self.font).render(str(s),True,color or self.WHITE),(x,y))
+    def draw_car(self,state,length,width,color):
+        pts=[self.world(float(x),float(y)) for x,y in rectangle_corners(state.x,state.y,state.heading,length,width)]
+        pygame.draw.polygon(self.screen,color,pts); pygame.draw.polygon(self.screen,(8,13,19),pts,2)
+        c,s=math.cos(state.heading),math.sin(state.heading)
+        def lp(lx,ly): return self.world(state.x+lx*c-ly*s,state.y+lx*s+ly*c)
+        glass=[lp(length*.1,-width*.34),lp(length*.34,-width*.34),lp(length*.34,width*.34),lp(length*.1,width*.34)]
+        pygame.draw.polygon(self.screen,(34,55,73),glass)
+    def draw(self,env,episode,reward,status,trajectory,paused=False,expert=False):
         self.screen.fill(self.BG)
-        self._text("AUTOPARK RL", 72, 25, self.WHITE, self.large)
-        self._text(f"MULTI-BAY PARKING  /  {mode}  /  OBSTACLE-AWARE SLOT SELECTION", 75, 65, self.MUTED, self.small)
-
-        arena = self.pg.Rect(
-            self.LEFT,
-            self.TOP,
-            int(env.ARENA_WIDTH * self.SCALE),
-            int(env.ARENA_HEIGHT * self.SCALE),
-        )
-        self.pg.draw.rect(self.screen, self.ASPHALT, arena, border_radius=10)
-        self.pg.draw.rect(self.screen, (77, 90, 105), arena, 2, border_radius=10)
-
-        # Driving aisle and dashed centre marking.
-        lane_top = self.world_to_screen(0.0, env.LANE_Y - 2.65)[1]
-        lane_bottom = self.world_to_screen(0.0, env.LANE_Y + 2.65)[1]
-        self.pg.draw.rect(self.screen, self.ROAD, (arena.left + 2, lane_top, arena.width - 4, lane_bottom - lane_top))
-        self.pg.draw.line(self.screen, (117, 128, 141), (arena.left + 10, (lane_top + lane_bottom) // 2), (arena.right - 10, (lane_top + lane_bottom) // 2), 2)
-        for sx in range(arena.left + 18, arena.right - 15, 55):
-            self.pg.draw.line(self.screen, (87, 99, 114), (sx, (lane_top + lane_bottom) // 2), (sx + 25, (lane_top + lane_bottom) // 2), 2)
-
-        # Subtle lot grid.
-        for col in range(1, 20):
-            sx = self.world_to_screen(float(col), 0.0)[0]
-            self.pg.draw.line(self.screen, (46, 54, 65), (sx, arena.top), (sx, arena.bottom), 1)
-
-        self._draw_bays(env)
-
-        for obstacle in env.obstacles:
-            self._draw_car(obstacle, env.vehicle.length, env.vehicle.width, self.BLUE)
-
-        path_points = [self.world_to_screen(x, y) for x, y in trajectory]
-        if len(path_points) > 1:
-            self.pg.draw.lines(self.screen, (255, 190, 72), False, path_points, 3)
-        staging = self.world_to_screen(env.staging_x, env.staging_y)
-        self.pg.draw.circle(self.screen, (96, 210, 223), staging, 7, 2)
-        self.pg.draw.circle(self.screen, (96, 210, 223), staging, 2)
-        self._draw_car(env.car, env.vehicle.length, env.vehicle.width, self.YELLOW, "AI")
-
-        # Dashboard panel.
-        panel_y = arena.bottom + 18
-        free = sum(not bool(r["occupied"]) for r in env.slot_records)
-        feasible = sum(bool(r["feasible"]) for r in env.slot_records)
-        self._text(f"EPISODE  {episode}", 76, panel_y, self.WHITE)
-        self._text(f"TARGET  {env.target_slot_id}", 270, panel_y, self.YELLOW)
-        self._text(f"FREE BAYS  {free}/12", 460, panel_y, self.GREEN)
-        self._text(f"FEASIBLE  {feasible}", 650, panel_y, self.TEAL)
-        self._text(f"REWARD  {reward:8.1f}", 850, panel_y, self.WHITE)
-        self._text(f"SPEED  {env.car.speed:+.2f} m/s", 1080, panel_y, self.WHITE)
-
-        phase = "APPROACH + ALIGN" if env.stage == 0 else "ENTER BAY + STOP"
-        self._text(f"PHASE  {phase}", 76, panel_y + 34, self.TEAL if env.stage == 0 else self.YELLOW)
-        self._text(f"DISTANCE  {env._target_distance():.2f} m", 350, panel_y + 34, self.WHITE)
-        self._text(f"ANGLE ERROR  {math.degrees(abs(env._angle_error())):.1f} deg", 580, panel_y + 34, self.WHITE)
-        self._text(f"STEPS  {env.step_count}/{env.max_steps}", 900, panel_y + 34, self.WHITE)
-
-        status_color = self.GREEN if "SUCCESS" in status else self.RED if ("COLLISION" in status or "OUTSIDE" in status) else self.YELLOW
-        self._text(status, 76, panel_y + 68, status_color, self.font)
-        mode = "DETERMINISTIC" if deterministic else "STOCHASTIC"
-        self._text(f"POLICY  {mode}     SPACE pause  |  N next episode  |  R reset  |  ESC exit", 76, self.HEIGHT - 29, self.MUTED, self.small)
-
+        self.text("AUTOPARK RL  /  v0.4",45,18,self.WHITE,self.large)
+        self.text(f"MODE  {env.mode.upper()}   |   TARGET  {env.target_slot_id}   |   {'EXPERT BASELINE' if expert else 'PPO POLICY'}",48,48,self.MUTED,self.small)
+        arena=pygame.Rect(self.LEFT,self.TOP,int(env.ARENA_WIDTH*self.SCALE),int(env.ARENA_HEIGHT*self.SCALE))
+        pygame.draw.rect(self.screen,self.ASPHALT,arena,border_radius=8)
+        lane_top=self.world(0,env.LANE_Y-2.15)[1]; lane_bot=self.world(0,env.LANE_Y+2.15)[1]
+        pygame.draw.rect(self.screen,self.ROAD,(arena.left,lane_top,arena.width,lane_bot-lane_top))
+        cy=self.world(0,env.LANE_Y)[1]
+        for x in range(arena.left+10,arena.right-10,48): pygame.draw.line(self.screen,(110,123,137),(x,cy),(x+22,cy),2)
+        for rec in env.slot_records:
+            poly=rectangle_corners(rec["x"],rec["y"],rec["heading"],rec["length"],rec["width"])
+            pts=[self.world(float(x),float(y)) for x,y in poly]
+            if rec["occupied"]: fill=(46,68,93); edge=self.BLUE
+            elif rec["selected"]: fill=(86,79,40); edge=self.YELLOW
+            elif rec["feasible"]: fill=(35,73,62); edge=self.GREEN
+            else: fill=(68,48,54); edge=self.RED
+            pygame.draw.polygon(self.screen,fill,pts); pygame.draw.polygon(self.screen,edge,pts,2)
+            p=self.world(rec["x"],rec["y"]); self.text(rec["id"],p[0]-10,p[1]-8,self.WHITE,self.tiny)
+        # Expert route / agent trajectory.
+        for i in range(1,len(env.path),5):
+            p0=self.world(*env.path[i-1]); p1=self.world(*env.path[i]); pygame.draw.line(self.screen,(82,143,160),p0,p1,1)
+        pts=[self.world(x,y) for x,y in trajectory]
+        if len(pts)>1: pygame.draw.lines(self.screen,self.YELLOW,False,pts,3)
+        for obstacle in env.obstacles: self.draw_car(obstacle,env.vehicle.length,env.vehicle.width,self.BLUE)
+        self.draw_car(env.car,env.vehicle.length,env.vehicle.width,(244,185,64))
+        # LiDAR rays (16) from front/side sensor origin.
+        for i,rng in enumerate(env.last_lidar):
+            angle=env.car.heading+2*math.pi*i/env.LIDAR_COUNT
+            end=self.world(env.car.x+rng*math.cos(angle),env.car.y+rng*math.sin(angle))
+            start=self.world(env.car.x,env.car.y)
+            pygame.draw.line(self.screen,(54,190,190),start,end,1)
+            pygame.draw.circle(self.screen,(87,221,210),end,3)
+        # Side dashboard.
+        panel_x=arena.right+35
+        pygame.draw.rect(self.screen,(24,31,42),(panel_x,65,360,arena.height+80),border_radius=10)
+        self.text("VEHICLE TELEMETRY",panel_x+18,82,self.WHITE,self.font)
+        self.text(f"Speed: {env.car.speed:+.2f} m/s",panel_x+18,122)
+        self.text(f"Goal distance: {env._target_distance():.2f} m",panel_x+18,154)
+        self.text(f"Angle error: {math.degrees(abs(env._angle_error())):.1f} deg",panel_x+18,186)
+        self.text(f"Steps: {env.step_count}/{env.max_steps}",panel_x+18,218)
+        self.text(f"Free / feasible: {sum(not r['occupied'] for r in env.slot_records)} / {sum(r['feasible'] for r in env.slot_records)}",panel_x+18,250,self.GREEN)
+        self.text("ULTRASONIC (m)",panel_x+18,296,self.WHITE,self.small)
+        labels=["FRONT","REAR","LEFT","RIGHT"]
+        for i,(label,value) in enumerate(zip(labels,env.last_sonar)):
+            self.text(f"{label:>6}: {value:4.1f}",panel_x+18,322+i*25,(88,215,205),self.small)
+        self.text("LIDAR 16-RAY",panel_x+18,432,self.WHITE,self.small)
+        for i in range(4):
+            vals=env.last_lidar[i*4:(i+1)*4]
+            self.text("  ".join(f"{v:.1f}" for v in vals),panel_x+18,456+i*22,(88,215,205),self.tiny)
+        self.text("CAMERA / PERCEPTION",panel_x+18,558,self.WHITE,self.small)
+        frame=render_camera(env,288,216)
+        camera_surface=pygame.image.fromstring(frame.tobytes(),(288,216),"RGB")
+        camera_surface=pygame.transform.scale(camera_surface,(324,243))
+        self.screen.blit(camera_surface,(panel_x+18,584))
+        self.text(f"Camera occupied estimate: {int(env.camera_occupancy.sum())}",panel_x+18,840,self.GREEN,self.small)
+        status_color=self.GREEN if "SUCCESS" in status else self.RED if any(k in status for k in ("COLLISION","OUTSIDE")) else self.YELLOW
+        self.text(status,48,arena.bottom+20,status_color,self.font)
+        self.text("Keys: SPACE pause | N next | R reset | 1-4 mode | ESC quit",48,self.HEIGHT-28,self.MUTED,self.small)
         if paused:
-            overlay = self.pg.Surface((self.WIDTH, self.HEIGHT), self.pg.SRCALPHA)
-            overlay.fill((5, 8, 12, 135))
-            self.screen.blit(overlay, (0, 0))
-            pause_surface = self.large.render("PAUSED", True, self.WHITE)
-            self.screen.blit(pause_surface, pause_surface.get_rect(center=(self.WIDTH // 2, self.HEIGHT // 2)))
-
-        self.pg.display.flip()
+            overlay=pygame.Surface((self.WIDTH,self.HEIGHT),pygame.SRCALPHA); overlay.fill((0,0,0,150)); self.screen.blit(overlay,(0,0))
+            surf=self.large.render("PAUSED",True,self.WHITE); self.screen.blit(surf,surf.get_rect(center=(self.WIDTH//2,self.HEIGHT//2)))
+        pygame.display.flip()

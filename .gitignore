@@ -7,10 +7,12 @@ __pycache__/
 models/*.zip
 models/*.pt
 models/checkpoints/
-reports/tensorboard/**
+reports/tensorboard/
 reports/training/*.npz
 reports/training/*.jsonl
 reports/evaluation/*.csv
 reports/evaluation/*.json
+reports/evaluation/REPORT.md
 reports/figures/*.png
-!reports/**/.gitkeep
+reports/figures/*.gif
+.DS_Store

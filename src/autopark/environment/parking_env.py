@@ -1,483 +1,401 @@
-"""Obstacle-aware multi-bay parking environment for AutoPark RL v0.3."""
-
+"""Four-mode multi-bay parking environment with sensor fusion and CV perception."""
 from __future__ import annotations
-
 import math
 from typing import Any
-
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from autopark.physics import (
-    CarState,
-    VehicleParams,
-    normalize_angle,
-    rectangle_corners,
-    rectangles_intersect,
-    step_bicycle,
-)
+from autopark.physics import (CarState, VehicleParams, normalize_angle, rectangle_corners,
+                               rectangles_intersect, step_bicycle)
+from autopark.sensors import collect_ranges
+from autopark.vision import render_camera, detect_bay_occupancy
+
+MODES = ("perpendicular", "reverse", "parallel", "tight")
+MODE_INDEX = {name:i for i,name in enumerate(MODES)}
+
+
+def _bezier(p0, p1, p2, p3, n=120):
+    t=np.linspace(0.0,1.0,n,dtype=np.float64)[:,None]
+    omt=1.0-t
+    points=(omt**3)*np.asarray(p0)+(3*omt**2*t)*np.asarray(p1)+(3*omt*t**2)*np.asarray(p2)+(t**3)*np.asarray(p3)
+    deriv=(3*omt**2)*(np.asarray(p1)-np.asarray(p0))+(6*omt*t)*(np.asarray(p2)-np.asarray(p1))+(3*t**2)*(np.asarray(p3)-np.asarray(p2))
+    headings=np.arctan2(deriv[:,1],deriv[:,0])
+    return points, headings
 
 
 class ParkingEnv(gym.Env):
-    """A multi-bay parking task with a built-in expert demonstrator.
+    """Agent parks a car in one of four scenarios.
 
-    The parking manager chooses an available bay after checking the parked-car
-    geometry and a straight entry corridor. The agent then turns into the aisle,
-    aligns with the bay, enters it, and stops inside the marked footprint.
+    Observation is a fused low-dimensional vector: vehicle state, target-relative
+    pose, mode encoding, 16 LiDAR rays, four ultrasonic ranges, bay occupancy,
+    free-space feasibility, and occupancy detected from the virtual RGB camera.
     """
+    metadata={"render_modes":[]}
+    ARENA_WIDTH=24.0
+    ARENA_HEIGHT=18.0
+    LANE_Y=9.0
+    DT=0.10
+    MAX_STEPS=650
+    LIDAR_COUNT=16
+    MAX_SENSOR_RANGE=8.0
+    MAX_SLOTS=12
+    # 13 state + 4 mode + 2 gear + 16 lidar + 4 sonar + 3*12 slot/camera arrays = 75.
+    OBSERVATION_SIZE=75
 
-    metadata = {"render_modes": []}
-
-    ARENA_WIDTH = 20.0
-    ARENA_HEIGHT = 15.0
-    LANE_Y = 7.35
-    SLOT_X = tuple(2.9 + 2.82 * i for i in range(6))
-    SLOT_Y = (2.65, 11.95)
-    SLOT_WIDTH = 2.72
-    SLOT_LENGTH = 5.25
-    ROW_NAMES = ("A", "B")
-    DT = 0.1
-    MAX_STEPS = 500
-    N_SLOTS = 12
-    OBSERVATION_SIZE = 12 + 3 * N_SLOTS
-
-    def __init__(self, max_steps: int = MAX_STEPS, difficulty: float = 0.25):
+    def __init__(self, mode: str="mixed", max_steps: int=MAX_STEPS, difficulty: float=0.25,
+                 seed: int|None=None):
         super().__init__()
-        self.max_steps = int(max_steps)
-        self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
-        self.vehicle = VehicleParams()
-        self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0], dtype=np.float32),
-            dtype=np.float32,
-        )
-        self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(self.OBSERVATION_SIZE,),
-            dtype=np.float32,
-        )
+        if mode not in (*MODES,"mixed","all"):
+            raise ValueError(f"mode must be one of {MODES}, 'mixed' or 'all'")
+        self.requested_mode=mode
+        self.mode="perpendicular"
+        self.max_steps=int(max_steps)
+        self.difficulty=float(np.clip(difficulty,0.0,1.0))
+        self.vehicle=VehicleParams()
+        self.action_space=spaces.Box(low=np.array([-1.,-1.],np.float32),high=np.array([1.,1.],np.float32),dtype=np.float32)
+        self.observation_space=spaces.Box(low=-1.0,high=1.0,shape=(self.OBSERVATION_SIZE,),dtype=np.float32)
+        self.car=CarState(5.0,self.LANE_Y,0.0,0.0)
+        self.obstacles:list[CarState]=[]
+        self.slot_records:list[dict[str,Any]]=[]
+        self.occupancy=np.zeros(self.MAX_SLOTS,dtype=np.int8)
+        self.camera_occupancy=np.zeros(self.MAX_SLOTS,dtype=np.float32)
+        self.target_slot_id="A1"
+        self.target_x=3.0; self.target_y=3.0; self.target_heading=-math.pi/2
+        self.target_length=5.2; self.target_width=2.55
+        self.path=np.zeros((2,2),dtype=np.float64)
+        self.path_headings=np.zeros(2,dtype=np.float64)
+        self.path_cumulative=np.zeros(2,dtype=np.float64)
+        self.reverse_motion=False
+        self.step_count=0
+        self.previous_potential=0.0
+        self.last_action=np.zeros(2,dtype=np.float32)
+        self.last_lidar=[8.0]*self.LIDAR_COUNT
+        self.last_sonar=[4.0]*4
+        self._camera_frame=None
+        self._rng_seed=seed
 
-        self.car = CarState(6.0, self.LANE_Y, 0.0, 0.0)
-        self.obstacles: list[CarState] = []
-        self.occupancy = np.zeros((2, 6), dtype=np.int8)
-        self.slot_records: list[dict[str, Any]] = []
-        self.target_row = 0
-        self.target_col = 0
-        self.target_slot_id = "A1"
-        self.target_x = self.SLOT_X[0]
-        self.target_y = self.SLOT_Y[0]
-        self.target_heading = -math.pi / 2.0
-        self.approach_sign = 1.0
-        self.vertical_sign = -1.0
-        self.turn_sign = -1.0
-        self.staging_x = self.target_x
-        self.staging_y = self.LANE_Y - 3.9
-        self.stage = 0
-        self.step_count = 0
-        self.last_action = np.zeros(2, dtype=np.float32)
-        self.previous_potential = 0.0
-        self.selected_score = 0.0
-        self.last_collision = False
-
-    def set_difficulty(self, difficulty: float) -> None:
-        self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+    def set_difficulty(self,difficulty:float)->None:
+        self.difficulty=float(np.clip(difficulty,0.0,1.0))
 
     @staticmethod
-    def _slot_id(row: int, col: int) -> str:
-        return f"{ParkingEnv.ROW_NAMES[row]}{col + 1}"
+    def _bay_id(row:int,col:int)->str:
+        return f"{'A' if row==0 else 'B'}{col+1}"
 
-    def _car_polygon(self, state: CarState, margin: float = 0.0) -> np.ndarray:
-        return rectangle_corners(
-            state.x,
-            state.y,
-            state.heading,
-            self.vehicle.length + 2.0 * margin,
-            self.vehicle.width + 2.0 * margin,
-        )
+    def _mode_layout(self):
+        if self.mode=="parallel":
+            xs=[4.0,9.3,14.7,20.0]
+            ys=[5.55,12.45]
+            return [(r,c,x,ys[r],0.0 if r==0 else math.pi,5.15,2.55)
+                    for r,y in enumerate(ys) for c,x in enumerate(xs)]
+        xs=[3.0,6.6,10.2,13.8,17.4,21.0]
+        ys=[3.0,15.0]
+        width=2.18 if self.mode=="tight" else 2.55
+        length=4.72 if self.mode=="tight" else 5.25
+        return [(r,c,x,ys[r],-math.pi/2 if r==0 else math.pi/2,length,width)
+                for r,y in enumerate(ys) for c,x in enumerate(xs)]
 
-    def _inside_arena(self, polygon: np.ndarray) -> bool:
-        return bool(
-            np.all(polygon[:, 0] >= 0.12)
-            and np.all(polygon[:, 0] <= self.ARENA_WIDTH - 0.12)
-            and np.all(polygon[:, 1] >= 0.12)
-            and np.all(polygon[:, 1] <= self.ARENA_HEIGHT - 0.12)
-        )
+    def _poly(self,state:CarState,margin:float=0.0)->np.ndarray:
+        return rectangle_corners(state.x,state.y,state.heading,
+                                 self.vehicle.length+2*margin,self.vehicle.width+2*margin)
 
-    def _pose_is_clear(
-        self,
-        state: CarState,
-        obstacles: list[CarState],
-        margin: float = 0.0,
-    ) -> bool:
-        polygon = self._car_polygon(state, margin=margin)
-        if not self._inside_arena(polygon):
-            return False
-        return not any(
-            rectangles_intersect(polygon, self._car_polygon(obstacle))
-            for obstacle in obstacles
-        )
+    def _inside_arena(self,poly:np.ndarray)->bool:
+        return bool(np.all(poly[:,0]>=0.12) and np.all(poly[:,0]<=self.ARENA_WIDTH-.12)
+                    and np.all(poly[:,1]>=0.12) and np.all(poly[:,1]<=self.ARENA_HEIGHT-.12))
 
-    def _approach_is_clear(
-        self,
-        x: float,
-        y: float,
-        heading: float,
-        obstacles: list[CarState],
-    ) -> bool:
-        for t in np.linspace(0.0, 1.0, 22):
-            sample_y = self.LANE_Y + (y - self.LANE_Y) * float(t)
-            if not self._pose_is_clear(
-                CarState(x, sample_y, heading, 0.0), obstacles, margin=0.04
-            ):
+    def _pose_clear(self,state:CarState,obstacles:list[CarState],margin:float=0.0)->bool:
+        poly=self._poly(state,margin)
+        if not self._inside_arena(poly): return False
+        return not any(rectangles_intersect(poly,self._poly(o)) for o in obstacles)
+
+    def _path_for_slot(self,rec:dict[str,Any]):
+        tx,ty=rec["x"],rec["y"]
+        if self.mode=="parallel":
+            side=1.0 if tx<12.0 else -1.0
+            p0=(tx+side*6.0,self.LANE_Y)
+            p1=(tx+side*4.1,self.LANE_Y)
+            p2=(tx+side*1.9,ty)
+            p3=(tx,ty)
+            points,tangents=_bezier(p0,p1,p2,p3)
+            # Reverse into a curbside bay; the vehicle body faces opposite its travel vector.
+            headings=np.asarray([normalize_angle(float(a)+math.pi) for a in tangents])
+            target_heading=0.0 if side>0 else math.pi
+            start_heading=target_heading
+            reverse=True
+        else:
+            side=1.0 if tx<12.0 else -1.0
+            vertical=-1.0 if rec["row"]==0 else 1.0
+            p0=(tx+side*5.0,self.LANE_Y)
+            p1=(tx+side*2.5,self.LANE_Y)
+            p2=(tx,ty-vertical*2.4)
+            p3=(tx,ty)
+            points,tangents=_bezier(p0,p1,p2,p3)
+            reverse=self.mode=="reverse"
+            headings=np.asarray([normalize_angle(float(a)+(math.pi if reverse else 0.0)) for a in tangents])
+            target_heading=float(headings[-1])
+            start_heading=float(headings[0])
+        return points,headings,start_heading,target_heading,reverse
+
+    def _path_is_clear(self,points:np.ndarray,headings:np.ndarray,obstacles:list[CarState])->bool:
+        # Subsample every second spline point and retain a small safety margin.
+        for i in range(0,len(points),2):
+            state=CarState(float(points[i,0]),float(points[i,1]),float(headings[i]),0.0)
+            if not self._pose_clear(state,obstacles,margin=0.035):
                 return False
-        return True
+        state=CarState(float(points[-1,0]),float(points[-1,1]),float(headings[-1]),0.0)
+        return self._pose_clear(state,obstacles,margin=0.0)
 
-    def _build_slot_records(
-        self,
-        occupancy: np.ndarray,
-        obstacles: list[CarState],
-        start_x: float,
-    ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        fits = (
-            self.SLOT_WIDTH >= self.vehicle.width + 0.18
-            and self.SLOT_LENGTH >= self.vehicle.length + 0.18
-        )
-        for row in range(2):
-            heading = -math.pi / 2.0 if row == 0 else math.pi / 2.0
-            for col, x in enumerate(self.SLOT_X):
-                y = self.SLOT_Y[row]
-                occupied = bool(occupancy[row, col])
-                goal_clear = self._pose_is_clear(
-                    CarState(float(x), y, heading, 0.0), obstacles, margin=0.08
-                )
-                entry_clear = self._approach_is_clear(x, y, heading, obstacles)
-                feasible = bool(not occupied and fits and goal_clear and entry_clear)
-
-                adjacent = int(col > 0 and bool(occupancy[row, col - 1]))
-                adjacent += int(col < 5 and bool(occupancy[row, col + 1]))
-                adjacent += int(bool(occupancy[1 - row, col]))
-                distance = abs(float(x) - start_x)
-                # Penalize tight neighbors; use distance only as a tie-breaker.
-                score = 1.2 * adjacent + 0.055 * distance
-                records.append(
-                    {
-                        "id": self._slot_id(row, col),
-                        "row": row,
-                        "col": col,
-                        "x": float(x),
-                        "y": float(y),
-                        "heading": float(heading),
-                        "occupied": occupied,
-                        "feasible": feasible,
-                        "score": float(score),
-                        "occupied_neighbors": adjacent,
-                        "distance_from_start": float(distance),
-                    }
-                )
-        return records
-
-    def _make_map(self, reference_x: float) -> None:
-        """Generate a randomized lot and select a reachable, empty bay."""
-        occupancy_probability = 0.10 + 0.40 * self.difficulty
-        chosen_records = None
-        chosen_obstacles: list[CarState] = []
-        chosen_candidates: list[dict[str, Any]] = []
-
+    def _make_map(self,reference_x:float)->None:
+        specs=self._mode_layout()
+        prob=0.08+0.48*self.difficulty
+        chosen=None
         for _ in range(100):
-            occupancy = (
-                self.np_random.random((2, 6)) < occupancy_probability
-            ).astype(np.int8)
-            if int((occupancy == 0).sum()) < 4:
-                continue
-
-            obstacles: list[CarState] = []
-            for row in range(2):
-                heading = -math.pi / 2.0 if row == 0 else math.pi / 2.0
-                for col, x in enumerate(self.SLOT_X):
-                    if occupancy[row, col]:
-                        obstacles.append(CarState(float(x), self.SLOT_Y[row], heading, 0.0))
-
-            records = self._build_slot_records(occupancy, obstacles, reference_x)
-            candidates = [r for r in records if r["feasible"]]
-            if len(candidates) >= 2:
-                chosen_records, chosen_obstacles = records, obstacles
-                chosen_candidates = candidates
-                self.occupancy = occupancy
+            occupancy=(self.np_random.random(len(specs))<prob).astype(np.int8)
+            obstacles=[]
+            records=[]
+            for idx,(row,col,x,y,heading,length,width) in enumerate(specs):
+                records.append({"id":self._bay_id(row,col),"row":row,"col":col,"x":float(x),"y":float(y),
+                                "heading":float(heading),"length":float(length),"width":float(width),
+                                "occupied":bool(occupancy[idx]),"feasible":False,"selected":False})
+                if occupancy[idx]: obstacles.append(CarState(float(x),float(y),float(heading),0.0))
+            candidates=[]
+            for rec in records:
+                if rec["occupied"]: continue
+                # Vehicle fit, geometric clearance and the full approach path must all be valid.
+                if rec["length"] < self.vehicle.length+0.22 or rec["width"] < self.vehicle.width+0.22:
+                    continue
+                points,heads,start_h,target_h,reverse=self._path_for_slot(rec)
+                if not self._path_is_clear(points,heads,obstacles): continue
+                rec["feasible"]=True
+                neighbor_penalty=0.0
+                for other in records:
+                    if other["occupied"] and other["row"]==rec["row"] and abs(other["col"]-rec["col"])==1:
+                        neighbor_penalty+=0.8
+                distance=float(np.linalg.norm(points[0]-np.array([reference_x,self.LANE_Y])))
+                rec["score"]=0.045*distance+neighbor_penalty
+                candidates.append(rec)
+            if len(candidates)>=2:
+                chosen=(records,obstacles,candidates)
                 break
-        else:
-            # Keep the environment valid even in a rare over-constrained draw.
-            occupancy = np.zeros((2, 6), dtype=np.int8)
-            obstacles = []
-            records = self._build_slot_records(occupancy, obstacles, reference_x)
-            chosen_records = records
-            chosen_obstacles = obstacles
-            chosen_candidates = [r for r in records if r["feasible"]]
-            self.occupancy = occupancy
+        if chosen is None:
+            # Fallback: completely empty but still randomized mode geometry.
+            occupancy=np.zeros(len(specs),dtype=np.int8)
+            obstacles=[]; records=[]; candidates=[]
+            for idx,(row,col,x,y,heading,length,width) in enumerate(specs):
+                rec={"id":self._bay_id(row,col),"row":row,"col":col,"x":float(x),"y":float(y),
+                     "heading":float(heading),"length":float(length),"width":float(width),
+                     "occupied":False,"feasible":False,"selected":False}
+                points,heads,sh,th,rev=self._path_for_slot(rec)
+                rec["feasible"]=self._path_is_clear(points,heads,obstacles)
+                rec["score"]=0.04*float(np.linalg.norm(points[0]-np.array([reference_x,self.LANE_Y])))
+                records.append(rec)
+                if rec["feasible"]: candidates.append(rec)
+            if len(candidates)<1: raise RuntimeError(f"Could not generate a feasible map for mode={self.mode}")
+            chosen=(records,obstacles,candidates)
+        records,obstacles,candidates=chosen
+        scores=np.asarray([r.get("score",0.0) for r in candidates],dtype=np.float64)
+        weights=np.exp(-(scores-scores.min())/0.7); weights/=weights.sum()
+        selected=candidates[int(self.np_random.choice(len(candidates),p=weights))]
+        selected["selected"]=True
+        self.slot_records=records
+        self.obstacles=obstacles
+        self.target_slot_id=selected["id"]
+        self.target_x=float(selected["x"]); self.target_y=float(selected["y"])
+        self.target_length=float(selected["length"]); self.target_width=float(selected["width"])
+        self.path,self.path_headings,start_heading,self.target_heading,self.reverse_motion=self._path_for_slot(selected)
+        diffs=np.diff(self.path,axis=0)
+        self.path_cumulative=np.concatenate([[0.0],np.cumsum(np.linalg.norm(diffs,axis=1))])
+        self.car=CarState(float(self.path[0,0]),float(self.path[0,1]),float(start_heading),0.0)
+        # Mild randomized pose noise encourages sensor robustness without breaking expert reachability.
+        self.car.x+=float(self.np_random.uniform(-0.025,0.025))
+        self.car.y+=float(self.np_random.uniform(-0.025,0.025))
+        self.car.heading=normalize_angle(self.car.heading+float(self.np_random.uniform(-0.01,0.01)))
+        if not self._pose_clear(self.car,self.obstacles):
+            raise RuntimeError("Generated initial pose collides with an obstacle")
+        self.camera_frame=render_camera(self)
+        detected=detect_bay_occupancy(self.camera_frame,self.slot_records,self.ARENA_WIDTH,self.ARENA_HEIGHT)
+        self.camera_occupancy=np.zeros(self.MAX_SLOTS,dtype=np.float32)
+        self.camera_occupancy[:min(len(detected),self.MAX_SLOTS)]=detected[:self.MAX_SLOTS]
+        self.bay_occupancy=np.zeros(self.MAX_SLOTS,dtype=np.float32)
+        self.bay_feasible=np.zeros(self.MAX_SLOTS,dtype=np.float32)
+        for i,r in enumerate(self.slot_records[:self.MAX_SLOTS]):
+            self.bay_occupancy[i]=float(r["occupied"])
+            self.bay_feasible[i]=float(r["feasible"])
+        # For parallel mode only 8 marked bays exist; the remaining slots are padded as unavailable.
 
-        if not chosen_candidates:
-            raise RuntimeError("Parking map generator failed to produce a feasible bay")
+    def _target_distance(self)->float:
+        return math.hypot(self.target_x-self.car.x,self.target_y-self.car.y)
 
-        selected = min(
-            chosen_candidates,
-            key=lambda r: r["score"] + float(self.np_random.uniform(0.0, 0.9)),
-        )
-        self.obstacles = chosen_obstacles
-        self.slot_records = chosen_records or []
-        self.target_row = int(selected["row"])
-        self.target_col = int(selected["col"])
-        self.target_slot_id = str(selected["id"])
-        self.target_x = float(selected["x"])
-        self.target_y = float(selected["y"])
-        self.target_heading = float(selected["heading"])
-        self.vertical_sign = -1.0 if self.target_row == 0 else 1.0
-        self.selected_score = float(selected["score"])
+    def _angle_error(self)->float:
+        return normalize_angle(self.target_heading-self.car.heading)
 
-        turn_radius = self.vehicle.wheelbase / math.tan(self.vehicle.max_steering)
-        viable = []
-        for sign in (1.0, -1.0):
-            start_candidate = self.target_x - sign * turn_radius
-            if 2.5 <= start_candidate <= self.ARENA_WIDTH - 2.5:
-                viable.append((abs(start_candidate - reference_x), sign, start_candidate))
-        if not viable:
-            raise RuntimeError(f"No safe turning start for bay {self.target_slot_id}")
-        _, self.approach_sign, base_start_x = min(viable, key=lambda item: item[0])
-        self.turn_sign = self.vertical_sign * self.approach_sign
-        self.staging_x = self.target_x
-        self.staging_y = self.LANE_Y + self.vertical_sign * turn_radius
+    def _local_error(self)->tuple[float,float]:
+        dx,dy=self.target_x-self.car.x,self.target_y-self.car.y
+        c,s=math.cos(self.target_heading),math.sin(self.target_heading)
+        longitudinal=dx*c+dy*s
+        lateral=-dx*s+dy*c
+        return longitudinal,lateral
 
-        for record in self.slot_records:
-            record["selected"] = record["id"] == self.target_slot_id
-            record["start_x"] = float(base_start_x)
+    def _path_remaining(self)->float:
+        distances=np.linalg.norm(self.path-np.array([self.car.x,self.car.y]),axis=1)
+        idx=int(np.argmin(distances))
+        return float(max(0.0,self.path_cumulative[-1]-self.path_cumulative[idx]))
 
-    def _target_distance(self) -> float:
-        return math.hypot(self.target_x - self.car.x, self.target_y - self.car.y)
+    def _potential(self)->float:
+        longitudinal,lateral=self._local_error()
+        return self._target_distance()+0.85*abs(self._angle_error())+0.18*abs(lateral)
 
-    def _staging_distance(self) -> float:
-        return math.hypot(self.staging_x - self.car.x, self.staging_y - self.car.y)
-
-    def _angle_error(self) -> float:
-        return normalize_angle(self.target_heading - self.car.heading)
-
-    def _bearing_error(self) -> float:
-        dx = self.target_x - self.car.x
-        dy = self.target_y - self.car.y
-        if abs(dx) + abs(dy) < 1e-8:
-            return self._angle_error()
-        return normalize_angle(math.atan2(dy, dx) - self.car.heading)
-
-    def _potential(self) -> float:
-        if self.stage == 0:
-            return 0.75 * self._staging_distance() + 1.8 * abs(self._angle_error())
-        return self._target_distance() + 0.8 * abs(self._angle_error())
-
-    def _observation(self) -> np.ndarray:
-        waypoint_x = self.staging_x if self.stage == 0 else self.target_x
-        waypoint_y = self.staging_y if self.stage == 0 else self.target_y
-        angle_error = self._angle_error()
-        bearing_error = self._bearing_error()
-        values: list[float] = [
-            2.0 * self.car.x / self.ARENA_WIDTH - 1.0,
-            2.0 * self.car.y / self.ARENA_HEIGHT - 1.0,
-            math.sin(self.car.heading),
-            math.cos(self.car.heading),
-            self.car.speed / self.vehicle.max_speed,
-            (waypoint_x - self.car.x) / self.ARENA_WIDTH,
-            (waypoint_y - self.car.y) / self.ARENA_HEIGHT,
-            math.sin(angle_error),
-            math.cos(angle_error),
-            float(self.stage),
-            math.sin(bearing_error),
-            math.cos(bearing_error),
+    def _observation(self)->np.ndarray:
+        lidar,sonar=collect_ranges(self.car,self.obstacles,self.ARENA_WIDTH,self.ARENA_HEIGHT,
+                                   self.vehicle.length,self.vehicle.width,self.LIDAR_COUNT,self.MAX_SENSOR_RANGE)
+        self.last_lidar,self.last_sonar=lidar,sonar
+        dx,dy=self.target_x-self.car.x,self.target_y-self.car.y
+        c,s=math.cos(self.car.heading),math.sin(self.car.heading)
+        local_forward=(c*dx+s*dy)/12.0
+        local_left=(-s*dx+c*dy)/12.0
+        angle_err=self._angle_error()
+        mode_onehot=[1.0 if self.mode==m else 0.0 for m in MODES]
+        longitudinal,lateral=self._local_error()
+        path_remaining=self._path_remaining()/20.0
+        progress=1.0-path_remaining
+        state=[
+            2*self.car.x/self.ARENA_WIDTH-1,
+            2*self.car.y/self.ARENA_HEIGHT-1,
+            math.sin(self.car.heading),math.cos(self.car.heading),
+            self.car.speed/self.vehicle.max_speed,
+            float(np.clip(local_forward,-1,1)),float(np.clip(local_left,-1,1)),
+            math.sin(angle_err),math.cos(angle_err),
+            float(np.clip(self._target_distance()/15.0,0,1)),
+            float(np.clip(path_remaining,0,1)),float(np.clip(progress,0,1)),
+            float(np.clip(lateral/5.0,-1,1)),
         ]
-        values.extend(float(r["occupied"]) for r in self.slot_records)
-        values.extend(float(r["feasible"]) for r in self.slot_records)
-        values.extend(float(r.get("selected", False)) for r in self.slot_records)
-        return np.clip(np.asarray(values, dtype=np.float32), -1.0, 1.0)
+        gear=[0.0,1.0] if self.reverse_motion else [1.0,0.0]
+        values=state+mode_onehot+gear
+        values += [float(np.clip(v/self.MAX_SENSOR_RANGE,0,1)) for v in lidar]
+        values += [float(np.clip(v/4.0,0,1)) for v in sonar]
+        values += self.bay_occupancy.tolist()
+        values += self.bay_feasible.tolist()
+        values += self.camera_occupancy.tolist()
+        arr=np.asarray(values,dtype=np.float32)
+        if arr.shape!=(self.OBSERVATION_SIZE,):
+            raise RuntimeError(f"Observation shape mismatch: got {arr.shape}, expected {(self.OBSERVATION_SIZE,)}")
+        return np.clip(arr,-1.0,1.0)
 
-    def _check_collision(self) -> tuple[bool, bool]:
-        polygon = self._car_polygon(self.car)
-        if not self._inside_arena(polygon):
-            return False, True
+    def expert_action(self)->np.ndarray:
+        """Pure-pursuit path-tracking controller used for BC demonstrations and baseline."""
+        distances=np.linalg.norm(self.path-np.array([self.car.x,self.car.y]),axis=1)
+        nearest=int(np.argmin(distances))
+        lookahead=0.85+0.18*abs(self.car.speed)
+        desired_s=min(float(self.path_cumulative[-1]),float(self.path_cumulative[nearest])+lookahead)
+        target_idx=int(np.searchsorted(self.path_cumulative,desired_s,side="left"))
+        target_idx=min(target_idx,len(self.path)-1)
+        target=self.path[target_idx]
+        dx,dy=float(target[0]-self.car.x),float(target[1]-self.car.y)
+        travel_heading=normalize_angle(self.car.heading+(math.pi if self.reverse_motion else 0.0))
+        desired_travel=math.atan2(dy,dx)
+        alpha=normalize_angle(desired_travel-travel_heading)
+        distance=max(0.45,math.hypot(dx,dy))
+        curvature=2.0*math.sin(alpha)/distance
+        steering_angle=math.atan(self.vehicle.wheelbase*curvature)
+        # With signed negative velocity, the bicycle yaw response reverses.
+        if self.reverse_motion:
+            steering_angle=-steering_angle
+        steering=float(np.clip(steering_angle/self.vehicle.max_steering,-1.0,1.0))
+        remaining=self._target_distance()
+        target_speed=min(1.25,math.sqrt(max(0.0,2.0*1.0*max(remaining-0.18,0.0))))
+        if remaining<0.38:
+            target_speed=0.0
+        signed_target=-target_speed if self.reverse_motion else target_speed
+        throttle=float(np.clip(1.9*(signed_target-self.car.speed),-1.0,1.0))
+        # Correct the final heading gently when the position is already close.
+        if remaining<0.75 and (abs(self._angle_error())>math.radians(2.5) or remaining>0.18):
+            err=normalize_angle(self.target_heading-self.car.heading)
+            longitudinal,lateral=self._local_error()
+            # Choose the gear that moves toward the target; maintain a tiny rolling
+            # speed so steering can still change the heading at the final pose.
+            direction = 1.0 if longitudinal >= 0.0 else -1.0
+            if abs(longitudinal)<0.035:
+                direction = 1.0
+            correction=2.5*err/self.vehicle.max_steering
+            if direction < 0.0: correction=-correction
+            steering=float(np.clip(correction,-0.58,0.58))
+            if abs(self._angle_error())>math.radians(2.5):
+                magnitude=0.20 if remaining>0.16 else 0.13
+            else:
+                magnitude=min(0.16,max(0.08,remaining*0.45))
+            signed_target=direction*magnitude
+            throttle=float(np.clip(2.0*(signed_target-self.car.speed),-0.6,0.6))
+        return np.asarray([throttle,steering],dtype=np.float32)
+
+    def _check_collision(self)->tuple[bool,bool]:
+        poly=self._poly(self.car)
+        if not self._inside_arena(poly): return False,True
         for obstacle in self.obstacles:
-            if rectangles_intersect(polygon, self._car_polygon(obstacle)):
-                return True, False
-        return False, False
+            if rectangles_intersect(poly,self._poly(obstacle)): return True,False
+        return False,False
 
-    def _is_success(self) -> bool:
-        dx = self.car.x - self.target_x
-        dy = self.car.y - self.target_y
-        longitudinal = abs(dx * math.cos(self.target_heading) + dy * math.sin(self.target_heading))
-        lateral = abs(-dx * math.sin(self.target_heading) + dy * math.cos(self.target_heading))
-        return bool(
-            longitudinal < 0.42
-            and lateral < 0.32
-            and abs(self._angle_error()) < math.radians(8.0)
-            and abs(self.car.speed) < 0.16
-        )
+    def _is_success(self)->bool:
+        longitudinal,lateral=self._local_error()
+        return bool(abs(longitudinal)<0.43 and abs(lateral)<0.31 and
+                    abs(self._angle_error())<math.radians(7.0) and abs(self.car.speed)<0.16)
 
-    def expert_action(self) -> np.ndarray:
-        """Return a tested feedback-control action for demonstrations/baselines."""
-        if self.stage == 0:
-            angle_error = self._angle_error()
-            steering = self.turn_sign if abs(angle_error) > math.radians(3.0) else 0.0
-            target_speed = 0.65
-        else:
-            dx = self.target_x - self.car.x
-            dy = self.target_y - self.car.y
-            longitudinal = dx * math.cos(self.target_heading) + dy * math.sin(self.target_heading)
-            lateral = -dx * math.sin(self.target_heading) + dy * math.cos(self.target_heading)
-            heading_correction = math.atan2(lateral, max(abs(longitudinal), 0.55))
-            steering = float(np.clip(2.4 * (self._angle_error() + heading_correction), -1.0, 1.0))
-            distance = self._target_distance()
-            target_speed = min(
-                0.65,
-                math.sqrt(max(0.0, 2.0 * 1.4 * max(longitudinal - 0.10, 0.0))),
-            )
-            # Do not freeze just outside the success-angle tolerance: keep a
-            # very slow correction movement so the bicycle model can align.
-            if distance < 0.35 and abs(self._angle_error()) > math.radians(5.5):
-                target_speed = 0.18
-        throttle = float(np.clip(2.0 * (target_speed - self.car.speed), -1.0, 1.0))
-        return np.asarray([throttle, steering], dtype=np.float32)
-
-    def reset(
-        self,
-        *,
-        seed: int | None = None,
-        options: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    def reset(self,*,seed:int|None=None,options:dict[str,Any]|None=None):
         super().reset(seed=seed)
-        options = options or {}
-        reference_x = float(self.np_random.uniform(2.5, 17.5))
+        options=options or {}
+        if self.requested_mode in ("mixed","all"):
+            self.mode=MODES[int(self.np_random.integers(0,len(MODES)))]
+        else:
+            self.mode=self.requested_mode
+        if "mode" in options:
+            if options["mode"] not in MODES: raise ValueError(f"Unknown mode: {options['mode']}")
+            self.mode=str(options["mode"])
+        reference_x=float(self.np_random.uniform(3.0,self.ARENA_WIDTH-3.0))
         self._make_map(reference_x)
+        self.step_count=0
+        self.last_action=np.zeros(2,dtype=np.float32)
+        self.previous_potential=self._potential()
+        return self._observation(),self._info(False,False,False,False)
 
-        if "target_slot" in options:
-            requested = str(options["target_slot"]).upper()
-            selected = next(
-                (r for r in self.slot_records if r["id"] == requested and r["feasible"]),
-                None,
-            )
-            if selected is None:
-                raise ValueError(f"Requested target slot {requested!r} is not feasible")
-            self.target_row = int(selected["row"])
-            self.target_col = int(selected["col"])
-            self.target_slot_id = str(selected["id"])
-            self.target_x = float(selected["x"])
-            self.target_y = float(selected["y"])
-            self.target_heading = float(selected["heading"])
-            self.vertical_sign = -1.0 if self.target_row == 0 else 1.0
-            turn_radius = self.vehicle.wheelbase / math.tan(self.vehicle.max_steering)
-            viable = [
-                (abs(self.target_x - sign * turn_radius - reference_x), sign,
-                 self.target_x - sign * turn_radius)
-                for sign in (1.0, -1.0)
-                if 2.5 <= self.target_x - sign * turn_radius <= self.ARENA_WIDTH - 2.5
-            ]
-            _, self.approach_sign, _ = min(viable, key=lambda item: item[0])
-            self.turn_sign = self.vertical_sign * self.approach_sign
-            self.staging_x = self.target_x
-            self.staging_y = self.LANE_Y + self.vertical_sign * turn_radius
-            self.selected_score = float(selected["score"])
-            for record in self.slot_records:
-                record["selected"] = record["id"] == self.target_slot_id
-
-        turn_radius = self.vehicle.wheelbase / math.tan(self.vehicle.max_steering)
-        base_start_x = self.target_x - self.approach_sign * turn_radius
-        start_x = base_start_x + float(self.np_random.uniform(-0.08, 0.08))
-        start_y = self.LANE_Y + float(self.np_random.uniform(-0.08, 0.08))
-        if "start" in options:
-            start = options["start"]
-            start_x = float(start.get("x", start_x))
-            start_y = float(start.get("y", start_y))
-        start_heading = 0.0 if self.approach_sign > 0 else math.pi
-        if "start" in options and "heading" in options["start"]:
-            start_heading = float(options["start"]["heading"])
-        else:
-            start_heading += float(self.np_random.uniform(-0.015, 0.015))
-
-        self.car = CarState(start_x, start_y, normalize_angle(start_heading), 0.0)
-        if not self._pose_is_clear(self.car, self.obstacles):
-            raise RuntimeError("Generated initial car pose intersects an obstacle or arena boundary")
-
-        self.stage = 0
-        self.step_count = 0
-        self.last_action = np.zeros(2, dtype=np.float32)
-        self.last_collision = False
-        self.previous_potential = self._potential()
-        return self._observation(), self._info(False, False, False)
-
-    def step(
-        self,
-        action: np.ndarray,
-    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        action = np.asarray(action, dtype=np.float32).reshape(2)
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        self.last_action = action.copy()
-        self.car = step_bicycle(self.car, action, self.DT, self.vehicle)
-        self.step_count += 1
-
-        collision, outside = self._check_collision()
-        success = self._is_success()
-        stage_advanced = False
-        if self.stage == 0:
-            if (
-                abs(self._angle_error()) < math.radians(4.0)
-                and abs(self.car.speed) < 0.95
-            ):
-                self.stage = 1
-                stage_advanced = True
-
-        current_potential = self._potential()
-        reward = 2.2 * (self.previous_potential - current_potential) - 0.025
-        if self.stage == 0:
-            reward += 0.035 * max(0.0, self.car.speed)
-        else:
-            reward += 0.06 * max(0.0, 1.0 - self._target_distance())
-            reward -= 0.035 * abs(self.car.speed)
-        if stage_advanced:
-            reward += 18.0
-
-        terminated = False
-        truncated = False
+    def step(self,action:np.ndarray):
+        action=np.asarray(action,dtype=np.float32).reshape(2)
+        action=np.clip(action,self.action_space.low,self.action_space.high)
+        self.last_action=action.copy()
+        self.car=step_bicycle(self.car,action,self.DT,self.vehicle)
+        self.step_count+=1
+        collision,outside=self._check_collision()
+        success=self._is_success()
+        current_potential=self._potential()
+        reward=3.5*(self.previous_potential-current_potential)-0.012
+        reward-=0.006*abs(self.car.speed)
+        if self._target_distance()<1.0:
+            reward+=0.035*(1.0-abs(self.car.speed)/self.vehicle.max_speed)
+        terminated=False; truncated=False
         if collision:
-            reward -= 160.0
-            terminated = True
+            reward-=180.0; terminated=True
         elif outside:
-            reward -= 160.0
-            terminated = True
+            reward-=150.0; terminated=True
         elif success:
-            reward += 180.0
-            terminated = True
-        elif self.step_count >= self.max_steps:
-            reward -= 25.0
-            truncated = True
+            reward+=220.0; terminated=True
+        elif self.step_count>=self.max_steps:
+            reward-=45.0; truncated=True
+        self.previous_potential=current_potential
+        info=self._info(success,collision,outside,truncated)
+        return self._observation(),float(reward),terminated,truncated,info
 
-        self.previous_potential = current_potential
-        self.last_collision = collision
-        info = self._info(success, collision, outside)
-        info["stage_advanced"] = stage_advanced
-        return self._observation(), float(reward), terminated, truncated, info
-
-    def _info(self, success: bool, collision: bool, outside: bool) -> dict[str, Any]:
+    def _info(self,success:bool,collision:bool,outside:bool,timeout:bool)->dict[str,Any]:
         return {
-            "success": bool(success),
-            "collision": bool(collision),
-            "outside_bounds": bool(outside),
-            "target_slot": self.target_slot_id,
-            "free_slots": int(sum(not bool(r["occupied"]) for r in self.slot_records)),
-            "feasible_slots": int(sum(bool(r["feasible"]) for r in self.slot_records)),
-            "occupied_slots": int(len(self.obstacles)),
-            "distance": float(self._target_distance()),
-            "staging_distance": float(self._staging_distance()),
-            "angle_error_deg": float(math.degrees(abs(self._angle_error()))),
-            "bearing_error_deg": float(math.degrees(abs(self._bearing_error()))),
-            "speed": float(self.car.speed),
-            "stage": int(self.stage),
-            "steps": int(self.step_count),
+            "success":bool(success),"collision":bool(collision),"outside_bounds":bool(outside),"timeout":bool(timeout),
+            "mode":self.mode,"target_slot":self.target_slot_id,
+            "free_slots":int(sum(not r["occupied"] for r in self.slot_records)),
+            "feasible_slots":int(sum(r["feasible"] for r in self.slot_records)),
+            "occupied_slots":int(len(self.obstacles)),"distance":float(self._target_distance()),
+            "angle_error_deg":float(math.degrees(abs(self._angle_error()))),
+            "speed":float(self.car.speed),"steps":int(self.step_count),
+            "lidar_min_m":float(min(self.last_lidar)) if self.last_lidar else self.MAX_SENSOR_RANGE,
+            "camera_detected_occupied":int(self.camera_occupancy.sum()),
+            "ground_truth_occupied":int(len(self.obstacles)),
+            "camera_occupancy_match":bool(np.array_equal(self.camera_occupancy,self.bay_occupancy)),
         }
 
-    def close(self) -> None:
+    def close(self):
         return None
